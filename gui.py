@@ -1,19 +1,30 @@
-\
 import sys
 import time
+import io # Added
+from functools import partial # Added for connecting signals with arguments
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QSpinBox, QTabWidget, QListWidget, QListWidgetItem, # Added QListWidgetItem
+    QPushButton, QSpinBox, QTabWidget, QListWidget, QListWidgetItem,
     QMessageBox, QProgressDialog, QGroupBox, QFormLayout, QRadioButton,
-    QSpacerItem, QSizePolicy
+    QSpacerItem, QSizePolicy, QScrollArea, QFrame, QTextEdit # Added QTextEdit for bio
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QBuffer, QIODevice, pyqtSlot, QUrl # Added QUrl
+from PyQt6.QtGui import QPixmap, QPalette, QColor, QCursor, QPainter, QFont # Added QPainter, QFont
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply # Added networking modules
 
 # Import API functions and exception from main.py
 from main import (
     get_session_key, search_track, get_album_tracks, scrobble_multiple_tracks,
-    LastfmApiError, API_KEY, API_SECRET, USERNAME, PASSWORD
+    get_track_info, get_album_info, # Added get_album_info
+    search_artist, get_artist_info, get_artist_top_tracks, get_artist_albums, # Added artist functions
+    LastfmApiError, API_KEY, API_SECRET, USERNAME, PASSWORD,
 )
+
+# --- Constants ---
+PLACEHOLDER_SIZE = 64
+ARTIST_IMAGE_SIZE = 96
+ALBUM_COVER_SIZE_MANUAL = 128
+ALBUM_COVER_SIZE_ALBUM_TAB = 150
 
 # --- Worker Thread for API Calls ---
 # To prevent the GUI from freezing during network requests
@@ -22,6 +33,7 @@ class ApiWorker(QThread):
     finished = pyqtSignal(object) # Can carry results or error info
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int, str) # current_count, total_count, message
+    image_fetched = pyqtSignal(str, QPixmap) # url, pixmap - Signal for image fetching
 
     def __init__(self, task, *args, **kwargs):
         super().__init__()
@@ -44,6 +56,15 @@ class ApiWorker(QThread):
                      self.progress.emit(current, total, message)
                  # Add it to the keyword arguments passed to the task
                  self.kwargs['progress_callback'] = progress_callback
+
+            # Separate handling for image fetching task if we add one later
+            # elif self.task == self.fetch_image_task:
+            #     url = self.args[0]
+            #     pixmap = self.fetch_image_task(url)
+            #     if pixmap:
+            #         self.image_fetched.emit(url, pixmap)
+            #     # Handle image fetch errors if necessary
+            #     return # Don't emit finished for image task
 
             result = self.task(*self.args, **self.kwargs)
             if not self._is_interruption_requested: # Only emit finished if not cancelled
@@ -72,18 +93,31 @@ class LastfmScrobblerApp(QWidget):
         self.progress_dialog = None # To show progress during long tasks
         self.current_album_artist = None # Store artist for album scrobble
         self.current_album_name = None # Store album name for album scrobble
+        self.network_manager = QNetworkAccessManager(self) # Initialize Network Manager
+        self.network_manager.finished.connect(self.handle_image_reply)
+        self.image_cache = {} # Simple cache for loaded QPixmaps
+        self.image_widget_map = {} # Map URL to target QLabel to display the image
+        self.selected_search_item_widget = None # Track selected search item
+        self.pending_replies = set() # Set to manage pending image downloads
+
         self.init_ui()
         self.authenticate() # Try to authenticate on startup
 
     def init_ui(self):
-        self.setWindowTitle('Last.fm Mass Scrobbler')
-        self.setGeometry(100, 100, 650, 500) # Increased size slightly
+        self.setWindowTitle('Last.fm Scrobbler Deluxe') # New Title
+        self.setGeometry(100, 100, 800, 650) # Even larger size
 
+        # Initialize search timer for dynamic searches
+        self.search_timer = QTimer()
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self.trigger_dynamic_search)
+        
         self.main_layout = QVBoxLayout(self)
 
         # Status Label (for auth status, errors, etc.)
-        self.status_label = QLabel("Status: Not Authenticated")
-        self.status_label.setStyleSheet("color: red; font-weight: bold;") # Make it bolder
+        self.status_label = QLabel("Status: Initializing...")
+        self.status_label.setObjectName("status_label") # Assign object name for styling
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.main_layout.addWidget(self.status_label)
 
         # --- Tabs for different functions ---
@@ -91,139 +125,315 @@ class LastfmScrobblerApp(QWidget):
         self.main_layout.addWidget(self.tabs)
 
         # -- Scrobble Tab --
-        self.scrobble_tab = QWidget()
-        self.tabs.addTab(self.scrobble_tab, "Single/Manual Scrobble") # Renamed tab
-        self.scrobble_layout = QVBoxLayout(self.scrobble_tab)
+        self._setup_scrobble_tab()
+        self._setup_search_tab()
+        self._setup_album_tab()
 
-        # Input Group
-        scrobble_input_group = QGroupBox("Scrobble Details")
+        # --- Auth Button --- #
+        self.auth_button = QPushButton("Authenticate")
+        self.auth_button.clicked.connect(self.authenticate)
+        self.main_layout.addWidget(self.auth_button)
+
+        self.status_label.setText("Status: Not Authenticated") # Set initial status after UI init
+        self.status_label.setStyleSheet("color: #FFA500; background-color: #404040; padding: 4px; border-radius: 3px;") # Orange-ish
+
+    def _setup_scrobble_tab(self):
+        # -- Scrobble Tab --
+        self.scrobble_tab = QWidget()
+        self.tabs.addTab(self.scrobble_tab, "Manual Scrobble")
+        self.scrobble_layout = QHBoxLayout(self.scrobble_tab)
+
+        # Left side: Form
+        # ... (form setup as before) ...
+        scrobble_form_widget = QWidget()
+        scrobble_form_layout_main = QVBoxLayout(scrobble_form_widget)
+        scrobble_input_group = QGroupBox("Track Details")
         scrobble_form_layout = QFormLayout()
 
         self.artist_input = QLineEdit()
+        self.artist_input.setPlaceholderText("Required")
         self.track_input = QLineEdit()
-        self.album_input = QLineEdit() # Optional album
+        self.track_input.setPlaceholderText("Required")
+        self.album_input = QLineEdit()
+        self.album_input.setPlaceholderText("Optional")
         self.count_input = QSpinBox()
-        self.count_input.setRange(1, 2800) # Sensible range
+        self.count_input.setRange(1, 2800)
         self.count_input.setValue(1)
         self.count_input.setToolTip("How many times to scrobble this specific track.")
 
         scrobble_form_layout.addRow("Artist:", self.artist_input)
         scrobble_form_layout.addRow("Track:", self.track_input)
-        scrobble_form_layout.addRow("Album (Optional):", self.album_input)
+        scrobble_form_layout.addRow("Album:", self.album_input)
         scrobble_form_layout.addRow("Scrobble Count:", self.count_input)
+
+        self.fetch_manual_album_info_button = QPushButton("Fetch Album Info")
+        self.fetch_manual_album_info_button.setToolTip("Fetch album cover and details based on Artist/Album fields")
+        self.fetch_manual_album_info_button.clicked.connect(self.fetch_album_info_for_manual_scrobble)
+        self.fetch_manual_album_info_button.setEnabled(False)
+        scrobble_form_layout.addRow(self.fetch_manual_album_info_button)
+
         scrobble_input_group.setLayout(scrobble_form_layout)
-        self.scrobble_layout.addWidget(scrobble_input_group)
+        scrobble_form_layout_main.addWidget(scrobble_input_group)
 
-        # Scrobble Button
         self.scrobble_button = QPushButton("Scrobble Track(s)")
-        self.scrobble_button.setEnabled(False) # Disabled until authenticated
-        self.scrobble_button.setStyleSheet("padding: 5px;") # Add padding
+        self.scrobble_button.setEnabled(False)
         self.scrobble_button.clicked.connect(self.start_scrobble_task)
-        self.scrobble_layout.addWidget(self.scrobble_button)
+        scrobble_form_layout_main.addWidget(self.scrobble_button, alignment=Qt.AlignmentFlag.AlignTop)
+        scrobble_form_layout_main.addStretch(1)
 
-        # Spacer to push elements up
-        self.scrobble_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+        self.scrobble_layout.addWidget(scrobble_form_widget, 2)
 
+        # Right side: Album Cover Preview
+        # ... (preview setup as before) ...
+        scrobble_preview_widget = QWidget()
+        scrobble_preview_layout = QVBoxLayout(scrobble_preview_widget)
+        scrobble_preview_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignCenter)
+        self.manual_album_cover_label = QLabel("Album cover preview")
+        self.manual_album_cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.manual_album_cover_label.setFixedSize(ALBUM_COVER_SIZE_MANUAL, ALBUM_COVER_SIZE_MANUAL)
+        self.manual_album_cover_label.setStyleSheet("border: 1px dashed #666; background-color: #383838;")
+        self.manual_album_cover_label.setToolTip("Album cover art will be shown here after fetching.")
+        scrobble_preview_layout.addWidget(self.manual_album_cover_label)
+        scrobble_preview_layout.addStretch(1)
+        self.scrobble_layout.addWidget(scrobble_preview_widget, 1)
 
+    def _setup_search_tab(self):
         # -- Search Tab --
         self.search_tab = QWidget()
         self.tabs.addTab(self.search_tab, "Search & Scrobble")
         self.search_layout = QVBoxLayout(self.search_tab)
 
         # Search Input Group
-        search_input_group = QGroupBox("Search Last.fm Track")
+        # ... (input setup as before) ...
+        search_input_group = QGroupBox("Search Last.fm")
         search_form_layout = QFormLayout()
         self.search_artist_input = QLineEdit()
+        self.search_artist_input.setPlaceholderText("Enter artist name (required for search)")
+        self.search_artist_input.textChanged.connect(self.on_search_text_changed)
         self.search_track_input = QLineEdit()
-        self.search_button = QPushButton("Search Track")
-        self.search_button.setStyleSheet("padding: 5px;")
-        self.search_button.clicked.connect(self.start_search_task)
-
+        self.search_track_input.setPlaceholderText("Enter track name (optional - searches tracks)")
+        self.search_track_input.textChanged.connect(self.on_search_text_changed)
         search_form_layout.addRow("Artist:", self.search_artist_input)
         search_form_layout.addRow("Track:", self.search_track_input)
         search_input_group.setLayout(search_form_layout)
         self.search_layout.addWidget(search_input_group)
-        self.search_layout.addWidget(self.search_button)
 
+        # Search Results Group (Corrected Layout)
+        search_results_group = QGroupBox("Search Results")
+        search_results_group_layout = QVBoxLayout(search_results_group) # Layout for the groupbox
 
-        # Search Results Group
-        search_results_group = QGroupBox("Search Results (Double-click to populate Scrobble tab)")
-        search_results_layout = QVBoxLayout()
-        self.search_results_list = QListWidget()
-        self.search_results_list.itemDoubleClicked.connect(self.populate_scrobble_from_search) # Double-click to use
-        search_results_layout.addWidget(self.search_results_list)
+        self.search_results_scroll_area = QScrollArea()
+        self.search_results_scroll_area.setWidgetResizable(True)
+        self.search_results_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.search_results_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.search_results_scroll_area.setObjectName("search_results_scroll")
 
-        # Scrobble from Search controls
+        # Widget and Layout *inside* the scroll area
+        self.search_results_widget = QWidget()
+        self.search_results_widget.setObjectName("search_results_widget")
+        self.search_results_layout = QVBoxLayout(self.search_results_widget) # Set layout ON the widget
+        self.search_results_layout.setContentsMargins(5, 5, 5, 5)
+        self.search_results_layout.setSpacing(6)
+        self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self.search_results_scroll_area.setWidget(self.search_results_widget)
+
+        # Add ScrollArea to the GroupBox layout
+        search_results_group_layout.addWidget(self.search_results_scroll_area)
+
+        # Scrobble controls (Now added correctly to the GroupBox layout below scroll area)
         search_scrobble_layout = QHBoxLayout()
         search_scrobble_layout.addWidget(QLabel("Scrobble Count:"))
         self.search_count_input = QSpinBox()
-        self.search_count_input.setRange(1, 50) # Lower default for search results
+        self.search_count_input.setRange(1, 2800) # <<< Updated Max Value
         self.search_count_input.setValue(1)
         search_scrobble_layout.addWidget(self.search_count_input)
         self.search_scrobble_button = QPushButton("Scrobble Selected Track")
-        self.search_scrobble_button.setStyleSheet("padding: 5px;")
-        self.search_scrobble_button.setEnabled(False) # Needs auth and selection
+        self.search_scrobble_button.setEnabled(False)
         self.search_scrobble_button.clicked.connect(self.scrobble_selected_search_result)
         search_scrobble_layout.addWidget(self.search_scrobble_button)
+        search_scrobble_layout.addStretch() # Push controls left
 
-        search_results_layout.addLayout(search_scrobble_layout)
-        search_results_group.setLayout(search_results_layout)
+        # Add scrobble controls layout to the GroupBox layout
+        search_results_group_layout.addLayout(search_scrobble_layout)
+
+        # Add the GroupBox to the main search tab layout
         self.search_layout.addWidget(search_results_group)
 
-
-        # -- Album Scrobble Tab --
+    def _setup_album_tab(self):
+         # -- Album Scrobble Tab --
         self.album_tab = QWidget()
         self.tabs.addTab(self.album_tab, "Album Scrobble")
         self.album_layout = QVBoxLayout(self.album_tab)
 
-        # Album Input Group
-        album_input_group = QGroupBox("Album Details")
-        album_form_layout = QFormLayout()
-        self.album_artist_input = QLineEdit()
-        self.album_name_input = QLineEdit()
-        self.fetch_tracks_button = QPushButton("Fetch Album Tracks")
-        self.fetch_tracks_button.setStyleSheet("padding: 5px;")
-        self.fetch_tracks_button.setEnabled(False) # Needs auth
-        self.fetch_tracks_button.clicked.connect(self.start_fetch_album_tracks_task)
+        # Top section: Input and Album Info
+        top_album_section_layout = QHBoxLayout()
 
+        # Album Input Group (Corrected Setup)
+        album_input_group = QGroupBox("Album Details")
+        album_form_layout = QFormLayout() # Create the form layout
+
+        self.album_artist_input = QLineEdit()
+        self.album_artist_input.setPlaceholderText("Artist Name")
+        self.album_name_input = QLineEdit()
+        self.album_name_input.setPlaceholderText("Album Title")
+
+        # Add widgets to the form layout
         album_form_layout.addRow("Artist:", self.album_artist_input)
         album_form_layout.addRow("Album:", self.album_name_input)
-        album_input_group.setLayout(album_form_layout)
-        self.album_layout.addWidget(album_input_group)
-        self.album_layout.addWidget(self.fetch_tracks_button)
+        album_input_group.setLayout(album_form_layout) # Set layout on the group box
 
-        # Album Tracks Group
+        self.fetch_tracks_button = QPushButton("Fetch Album Info")
+        self.fetch_tracks_button.setToolTip("Fetch album tracks and cover art")
+        self.fetch_tracks_button.clicked.connect(self.start_fetch_album_info_task)
+        # fetch button should probably be enabled when authenticated
+        # self.fetch_tracks_button.setEnabled(False)
+
+        # Layout for Input Group + Button
+        input_v_layout = QVBoxLayout()
+        input_v_layout.addWidget(album_input_group)
+        input_v_layout.addWidget(self.fetch_tracks_button)
+        input_v_layout.addStretch()
+        top_album_section_layout.addLayout(input_v_layout, 1)
+
+        # Album Cover/Info Display
+        album_display_group = QGroupBox("Fetched Album Info")
+        album_display_layout = QVBoxLayout(album_display_group)
+        album_display_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self.album_cover_label = QLabel("Album cover will appear here.")
+        self.album_cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.album_cover_label.setFixedSize(ALBUM_COVER_SIZE_ALBUM_TAB, ALBUM_COVER_SIZE_ALBUM_TAB)
+        self.album_cover_label.setStyleSheet("border: 1px dashed #666; background-color: #383838;")
+        album_display_layout.addWidget(self.album_cover_label)
+
+        self.album_info_label = QLabel("Album details...")
+        self.album_info_label.setWordWrap(True)
+        self.album_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        album_display_layout.addWidget(self.album_info_label)
+        album_display_layout.addStretch()
+        top_album_section_layout.addWidget(album_display_group, 1)
+
+        self.album_layout.addLayout(top_album_section_layout)
+
+        # Bottom section: Fetched Tracks List and Controls
         album_tracks_group = QGroupBox("Fetched Tracks")
-        album_tracks_layout = QVBoxLayout()
-        self.album_tracks_list = QListWidget()
-        self.album_tracks_list.setToolTip("List of tracks found for the specified album.")
-        album_tracks_layout.addWidget(self.album_tracks_list)
+        album_tracks_outer_layout = QVBoxLayout(album_tracks_group)
 
-        # Scrobble Album Controls
+        # Scroll Area setup
+        self.album_tracks_scroll_area = QScrollArea()
+        self.album_tracks_scroll_area.setWidgetResizable(True)
+        self.album_tracks_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.album_tracks_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.album_tracks_widget = QWidget()
+        self.album_tracks_widget.setObjectName("album_tracks_widget")
+        self.album_tracks_layout = QVBoxLayout(self.album_tracks_widget)
+        self.album_tracks_layout.setContentsMargins(5,5,5,5)
+        self.album_tracks_layout.setSpacing(4)
+        self.album_tracks_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.album_tracks_scroll_area.setWidget(self.album_tracks_widget)
+        album_tracks_outer_layout.addWidget(self.album_tracks_scroll_area)
+
+        # Controls layout setup
         album_scrobble_layout = QHBoxLayout()
         album_scrobble_layout.addWidget(QLabel("Scrobbles per Track:"))
         self.album_count_input = QSpinBox()
-        self.album_count_input.setRange(1, 50) # Sensible limit per track for albums
+        self.album_count_input.setRange(1, 2800) # <<< Updated Max Value
         self.album_count_input.setValue(1)
-        self.album_count_input.setToolTip("How many times EACH track in the list will be scrobbled.")
+        self.album_count_input.setToolTip("How many times EACH track in the list will be scrobled.")
         album_scrobble_layout.addWidget(self.album_count_input)
-
         self.scrobble_album_button = QPushButton("Scrobble Entire Album")
-        self.scrobble_album_button.setStyleSheet("padding: 5px;")
-        self.scrobble_album_button.setEnabled(False) # Needs tracks fetched and auth
+        # self.scrobble_album_button.setEnabled(False)
         self.scrobble_album_button.clicked.connect(self.start_scrobble_album_task)
         album_scrobble_layout.addWidget(self.scrobble_album_button)
+        album_tracks_outer_layout.addLayout(album_scrobble_layout)
 
-        album_tracks_layout.addLayout(album_scrobble_layout)
-        album_tracks_group.setLayout(album_tracks_layout)
         self.album_layout.addWidget(album_tracks_group)
 
+    # --- Image Handling --- Helper functions
+    def request_image(self, url, target_label):
+        """Requests an image download for the given URL and target QLabel."""
+        if not url:
+            # Set default/placeholder image if no URL
+            target_label.setPixmap(self.get_placeholder_pixmap(target_label.sizeHint(), "No Image"))
+            return
 
-        # --- Authentication Button (if needed) ---
-        self.auth_button = QPushButton("Re-authenticate")
-        self.auth_button.setStyleSheet("padding: 5px;")
-        self.auth_button.clicked.connect(self.authenticate)
-        self.main_layout.addWidget(self.auth_button)
+        if url in self.image_cache:
+            pixmap = self.image_cache[url]
+            self.set_scaled_pixmap(target_label, pixmap)
+        else:
+            target_label.setPixmap(self.get_placeholder_pixmap(target_label.sizeHint(), "Loading..."))
+            request = QNetworkRequest(QUrl(url))
+            request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, "LastfmScrobblerDeluxe/1.0")
+            reply = self.network_manager.get(request)
+            # Store the target label AND add reply to pending set
+            self.image_widget_map[url] = target_label
+            self.pending_replies.add(reply)
+
+    def handle_image_reply(self, reply: QNetworkReply):
+        """Handles the finished network reply for an image request."""
+        # Remove reply from pending set regardless of outcome
+        self.pending_replies.discard(reply)
+
+        url = reply.url().toString()
+        target_label = self.image_widget_map.pop(url, None)
+
+        if not target_label:
+            reply.deleteLater()
+            return
+
+        if reply.error() == QNetworkReply.NetworkError.NoError:
+            image_data = reply.readAll()
+            pixmap = QPixmap()
+            if pixmap.loadFromData(image_data):
+                self.image_cache[url] = pixmap
+                self.set_scaled_pixmap(target_label, pixmap)
+            else:
+                print(f"Error: Could not load image data from {url}")
+                target_label.setPixmap(self.get_placeholder_pixmap(target_label.sizeHint(), "Load Error"))
+        elif reply.error() == QNetworkReply.NetworkError.OperationCanceledError:
+             print(f"Image request cancelled for {url}")
+             # Optionally set a specific "Cancelled" placeholder
+             target_label.setPixmap(self.get_placeholder_pixmap(target_label.sizeHint(), "Cancelled"))
+        else:
+            error_string = reply.errorString()
+            print(f"Network Error ({reply.error()}): {error_string} for URL {url}")
+            placeholder_text = f"Net Error"
+            if reply.error() == QNetworkReply.NetworkError.ContentNotFoundError:
+                 placeholder_text = "Not Found"
+            target_label.setPixmap(self.get_placeholder_pixmap(target_label.sizeHint(), placeholder_text))
+
+        reply.deleteLater()
+
+    def set_scaled_pixmap(self, label, pixmap):
+        """Scales and sets a pixmap on a label, keeping aspect ratio."""
+        if not pixmap or pixmap.isNull():
+            label.setPixmap(self.get_placeholder_pixmap(label.sizeHint(), "Invalid"))
+            return
+        scaled_pixmap = pixmap.scaled(label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        label.setPixmap(scaled_pixmap)
+
+    def get_placeholder_pixmap(self, size, text=None):
+        """Creates a gray placeholder pixmap with optional text."""
+        pixmap = QPixmap(size)
+        if pixmap.isNull(): # Handle case where size might be invalid initially
+             pixmap = QPixmap(QSize(64, 64)) # Default fallback size
+        pixmap.fill(QColor('#444444')) # Slightly darker placeholder
+
+        if text:
+            painter = QPainter(pixmap)
+            painter.setPen(QColor('#AAAAAA'))
+            # Adjust font size based on pixmap size
+            font_size = max(8, min(size.width() // len(text) if len(text) > 0 else 10, size.height() // 3))
+            font = QFont()
+            font.setPointSize(font_size)
+            painter.setFont(font)
+            # Draw text centered
+            text_rect = pixmap.rect()
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.end()
+
+        return pixmap
 
     # --- Authentication Logic ---
     def authenticate(self):
@@ -240,15 +450,18 @@ class LastfmScrobblerApp(QWidget):
         if session_key:
             self.session_key = session_key
             self.status_label.setText("Status: Authenticated Successfully")
-            self.status_label.setStyleSheet("color: green; font-weight: bold;")
-            self.set_controls_enabled(True) # Enable controls now
-            self.auth_button.setText("Authenticated") # Change button text
-            self.auth_button.setEnabled(False) # Disable re-auth button for now
+            self.status_label.setStyleSheet("color: #50C878; background-color: #333; padding: 4px; border-radius: 3px;") # Greenish
+            self.set_controls_enabled(True)
+            self.auth_button.setText("Authenticated")
+            self.auth_button.setEnabled(False)
+            # --- Explicitly enable Album Fetch button --- #
+            self.fetch_tracks_button.setEnabled(True)
+            self.fetch_manual_album_info_button.setEnabled(True)
+            # ------------------------------------------ #
         else:
-            # Should be caught by auth_error, but handle just in case
             self.status_label.setText("Status: Authentication Failed (Unknown Reason)")
-            self.status_label.setStyleSheet("color: red; font-weight: bold;")
-            self.set_controls_enabled(True) # Re-enable controls
+            self.status_label.setStyleSheet("color: #FF6347; background-color: #400; padding: 4px; border-radius: 3px;") # Reddish
+            self.set_controls_enabled(True) # Keep controls enabled on fail, but auth button changes
             self.auth_button.setText("Re-authenticate")
             self.auth_button.setEnabled(True)
             QMessageBox.critical(self, "Authentication Error", "Failed to get session key.")
@@ -257,8 +470,8 @@ class LastfmScrobblerApp(QWidget):
     def auth_error(self, error_message):
         self.session_key = None
         self.status_label.setText("Status: Authentication Failed!")
-        self.status_label.setStyleSheet("color: red; font-weight: bold;")
-        self.set_controls_enabled(True) # Re-enable controls
+        self.status_label.setStyleSheet("color: #FF6347; background-color: #400; padding: 4px; border-radius: 3px;") # Reddish
+        self.set_controls_enabled(True) # Keep controls enabled on fail
         self.auth_button.setText("Re-authenticate")
         self.auth_button.setEnabled(True)
         self.api_worker = None
@@ -267,105 +480,638 @@ class LastfmScrobblerApp(QWidget):
 
     # --- Search Logic ---
     def start_search_task(self):
+        # This function might be redundant now with dynamic search, but keep for potential future use
         artist = self.search_artist_input.text().strip()
         track = self.search_track_input.text().strip()
 
-        if not artist or not track:
-            QMessageBox.warning(self, "Input Missing", "Please enter both Artist and Track name for search.")
+        if not artist:
+            QMessageBox.warning(self, "Input Missing", "Please enter an Artist name for search.")
             return
 
-        self.status_label.setText(f"Status: Searching for '{track}' by '{artist}'...")
-        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
-        self.set_controls_enabled(False)
-        self.search_results_list.clear()
+        # Re-use trigger_dynamic_search logic
+        self.trigger_dynamic_search()
+        # self.status_label.setText(f"Status: Searching...")
+        # self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+        # self.set_controls_enabled(False)
+        # self._clear_search_results_layout()
+        # self.search_scrobble_button.setEnabled(False)
+
+        # # Determine search type
+        # if track:
+        #     self.api_worker = ApiWorker(search_track, artist, track)
+        #     self.api_worker.finished.connect(self.search_tracks_finished)
+        # else:
+        #     self.api_worker = ApiWorker(search_artist, artist)
+        #     self.api_worker.finished.connect(self.search_artists_finished)
+
+        # self.api_worker.error.connect(self.search_error)
+        # self.api_worker.start()
+
+
+    def search_tracks_finished(self, results):
+        """Handles results from track.search API call."""
+        self.set_controls_enabled(True)
+        self._clear_search_results_layout()
+        self.selected_search_item_widget = None
         self.search_scrobble_button.setEnabled(False)
 
-        # Run search in worker thread
-        self.api_worker = ApiWorker(search_track, artist, track) # Use imported function
-        self.api_worker.finished.connect(self.search_finished)
-        self.api_worker.error.connect(self.search_error) # Use a generic error handler or specific one
-        self.api_worker.start()
-
-    def search_finished(self, results):
-        self.set_controls_enabled(True)
-        self.search_results_list.clear()
-
         if not results:
-            self.status_label.setText("Status: Search returned no results.")
+            self.status_label.setText("Status: Track search returned no results.")
             self.status_label.setStyleSheet("color: orange; font-weight: bold;")
-            self.search_results_list.addItem("No results found.")
-            self.search_scrobble_button.setEnabled(False)
+            self.search_results_layout.addWidget(QLabel("No tracks found."))
         else:
-            self.status_label.setText(f"Status: Found {len(results)} track(s). Double-click to use.")
+            self.status_label.setText(f"Status: Found {len(results)} track(s). Click to select, double-click to populate scrobble form.")
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
             for track_data in results:
-                # Create a user-friendly string for the list item
-                display_text = f"{track_data.get('name', 'N/A')} by {track_data.get('artist', 'N/A')}"
-                item = QListWidgetItem(display_text)
-                # Store the actual data within the item for later use
-                item.setData(Qt.ItemDataRole.UserRole, track_data)
-                self.search_results_list.addItem(item)
-            # Enable scrobble button only if authenticated (selection handled separately)
-            self.search_scrobble_button.setEnabled(bool(self.session_key))
+                item_widget = self.create_track_result_item(track_data)
+                self.search_results_layout.addWidget(item_widget)
 
         self.api_worker = None
+
+    def search_artists_finished(self, results):
+        """Handles results from artist.search API call."""
+        self.set_controls_enabled(True)
+        self._clear_search_results_layout()
+        self.selected_search_item_widget = None
+        self.search_scrobble_button.setEnabled(False) # Can't scrobble an artist directly
+
+        if not results:
+            self.status_label.setText("Status: Artist search returned no results.")
+            self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+            self.search_results_layout.addWidget(QLabel("No artists found."))
+        else:
+            self.status_label.setText(f"Status: Found {len(results)} artist(s). Click to select, double-click to view details.")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+            for artist_data in results:
+                item_widget = self.create_artist_result_item(artist_data) # Use the implemented function
+                self.search_results_layout.addWidget(item_widget)
+
+        self.api_worker = None
+
+    def create_track_result_item(self, track_data):
+        """Creates a QFrame widget representing a single track search result."""
+        item_frame = QFrame()
+        item_frame.setObjectName("search_result_item") # For styling
+        item_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        item_frame.setLineWidth(1)
+        item_frame.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)) # Make it look clickable
+        item_frame.setProperty("item_type", "track") # Identify item type
+        item_frame.setProperty("track_data", track_data) # Store data
+        item_frame.setProperty("selected", False)
+        # Use stylesheet
+
+        item_layout = QHBoxLayout(item_frame)
+        item_layout.setContentsMargins(5, 5, 5, 5)
+        item_layout.setSpacing(10)
+
+        # Image Label
+        image_label = QLabel()
+        image_size = PLACEHOLDER_SIZE # Use constant
+        image_label.setFixedSize(image_size, image_size)
+        image_label.setStyleSheet("border: none; border-radius: 4px;") # Rounded corners for image too
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.request_image(track_data.get('image_url'), image_label)
+        item_layout.addWidget(image_label)
+
+        # Text Labels Layout
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(2)
+
+        track_name = track_data.get('name', 'N/A')
+        artist_name = track_data.get('artist', 'N/A')
+
+        track_label = QLabel(f"<b>{track_name}</b>")
+        track_label.setToolTip(track_name)
+        # Style via QSS
+        artist_label = QLabel(artist_name)
+        artist_label.setObjectName("artist_label") # For specific styling
+        artist_label.setToolTip(artist_name)
+        # Style via QSS
+
+        text_layout.addWidget(track_label)
+        text_layout.addWidget(artist_label)
+        text_layout.addStretch()
+
+        item_layout.addLayout(text_layout)
+        item_layout.addStretch() # Push content left
+
+        listeners = track_data.get('listeners')
+        if listeners:
+            listeners_label = QLabel(f"{int(listeners):,} listeners")
+            listeners_label.setStyleSheet("color: #999999; font-size: 8pt; border: none; background: transparent;")
+            listeners_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+            item_layout.addWidget(listeners_label)
+
+        # Connect signals (using mousePressEvent for simplicity)
+        item_frame.mousePressEvent = partial(self.on_search_item_clicked, item_frame)
+        item_frame.mouseDoubleClickEvent = partial(self.on_search_item_double_clicked, item_frame)
+
+        return item_frame
+
+    def create_artist_result_item(self, artist_data):
+        """Creates a QFrame widget representing a single artist search result."""
+        item_frame = QFrame()
+        item_frame.setObjectName("search_result_item") # Use same object name for styling
+        item_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        item_frame.setLineWidth(1)
+        item_frame.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        item_frame.setProperty("item_type", "artist") # Identify item type
+        item_frame.setProperty("artist_data", artist_data)
+        item_frame.setProperty("selected", False)
+
+        item_layout = QHBoxLayout(item_frame)
+        item_layout.setContentsMargins(8, 8, 8, 8) # Slightly more padding for artists
+        item_layout.setSpacing(12)
+
+        # Artist Image
+        image_label = QLabel()
+        image_size = ARTIST_IMAGE_SIZE
+        image_label.setFixedSize(image_size, image_size)
+        image_label.setStyleSheet("border: none; border-radius: 4px;")
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.request_image(artist_data.get('image_url'), image_label)
+        item_layout.addWidget(image_label)
+
+        # Artist Name and Listeners
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(4)
+
+        artist_name = artist_data.get('name', 'N/A')
+        artist_label_widget = QLabel(f"<b>{artist_name}</b>") # Assign to variable
+        artist_label_widget.setToolTip(artist_name)
+        artist_label_widget.setStyleSheet("font-size: 12pt; border: none; background: transparent;") # Larger font, ensure no border/bg
+
+        listeners = artist_data.get('listeners')
+        listeners_label = QLabel(f"{int(listeners):,} listeners" if listeners else "Listeners: N/A")
+        listeners_label.setObjectName("artist_label") # Dimmer text (uses existing style)
+        listeners_label.setStyleSheet("border: none; background: transparent;") # Ensure no border/bg
+
+
+        text_layout.addWidget(artist_label_widget)
+        text_layout.addWidget(listeners_label)
+        text_layout.addStretch()
+
+        item_layout.addLayout(text_layout)
+        item_layout.addStretch()
+
+        # Connect signals
+        item_frame.mousePressEvent = partial(self.on_search_item_clicked, item_frame)
+        item_frame.mouseDoubleClickEvent = partial(self.on_artist_item_double_clicked, item_frame)
+
+        return item_frame
+
+    def on_search_item_clicked(self, item_widget, event):
+        """Handles single clicks on search result items.
+           Selects the item visually and populates the search input fields.
+        """
+        # Deselect previously selected item
+        if self.selected_search_item_widget and self.selected_search_item_widget != item_widget:
+             # ... (deselection logic as before) ...
+             try:
+                 self.selected_search_item_widget.setProperty("selected", False)
+                 self.selected_search_item_widget.setStyleSheet(self.selected_search_item_widget.styleSheet())
+             except RuntimeError:
+                 pass
+
+        # Select new item visually
+        item_widget.setProperty("selected", True)
+        item_widget.setStyleSheet(item_widget.styleSheet())
+        self.selected_search_item_widget = item_widget
+
+        item_type = item_widget.property("item_type")
+
+        # --- Populate Search Fields --- #
+        if item_type == "artist":
+            artist_data = item_widget.property("artist_data")
+            if artist_data:
+                artist_name = artist_data.get("name")
+                if artist_name:
+                    print(f"Artist '{artist_name}' clicked, populating search fields.")
+                    # Block signals temporarily to prevent immediate re-search trigger
+                    self.search_artist_input.blockSignals(True)
+                    self.search_track_input.blockSignals(True)
+
+                    self.search_artist_input.setText(artist_name)
+                    self.search_track_input.clear() # Clear track field when artist clicked
+
+                    self.search_artist_input.blockSignals(False)
+                    self.search_track_input.blockSignals(False)
+                    # Optionally trigger search timer or focus track input?
+                    # self.search_track_input.setFocus()
+                    # self.on_search_text_changed() # Manually trigger timer
+            # Keep scrobble button disabled for artist selection
+            self.search_scrobble_button.setEnabled(False)
+
+        elif item_type == "track":
+            track_data = item_widget.property("track_data")
+            if track_data:
+                artist_name = track_data.get("artist")
+                track_name = track_data.get("name")
+                if artist_name and track_name:
+                    print(f"Track '{track_name}' clicked, populating search fields.")
+                    # Block signals temporarily
+                    self.search_artist_input.blockSignals(True)
+                    self.search_track_input.blockSignals(True)
+
+                    self.search_artist_input.setText(artist_name)
+                    self.search_track_input.setText(track_name)
+
+                    self.search_artist_input.blockSignals(False)
+                    self.search_track_input.blockSignals(False)
+                    # Optionally trigger search?
+                    # self.on_search_text_changed() # Manually trigger timer
+
+            # Enable scrobble button only if authenticated and a TRACK item is selected
+            self.search_scrobble_button.setEnabled(bool(self.session_key))
+        else:
+            # Unknown item type, disable scrobble button
+             self.search_scrobble_button.setEnabled(False)
+
+    def on_search_item_double_clicked(self, item_widget, event):
+        """Handles double clicks to populate the scrobble tab (for tracks) or show artist details."""
+        item_type = item_widget.property("item_type")
+        if item_type == "track":
+            track_data = item_widget.property("track_data")
+            self.populate_scrobble_from_search(track_data)
+        elif item_type == "artist":
+            self.on_artist_item_double_clicked(item_widget, event)
+
+    def on_artist_item_double_clicked(self, item_widget, event):
+        """Handles double click on an artist item - show details in the search results area."""
+        artist_data = item_widget.property("artist_data")
+        if artist_data:
+            artist_name = artist_data.get("name")
+            print(f"Double clicked artist: {artist_name} - fetching details...")
+            self.fetch_and_display_artist_details(artist_name)
+
+    def fetch_and_display_artist_details(self, artist_name):
+        """Fetches detailed artist info via get_artist_info and shows it in the search results area."""
+        self.status_label.setText(f"Status: Fetching details for artist '{artist_name}'...")
+        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+        self.set_controls_enabled(False)
+        # Clear current results and show loading indicator
+        self._clear_search_results_layout()
+        loading_label = QLabel(f"Loading details for {artist_name}...")
+        loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.search_results_layout.addWidget(loading_label)
+
+        # Use worker thread
+        self.api_worker = ApiWorker(get_artist_info, artist_name)
+        self.api_worker.finished.connect(self.artist_info_finished)
+        self.api_worker.error.connect(self.search_error) # Reuse search error handler for now
+        self.api_worker.start()
+
+    def artist_info_finished(self, artist_info):
+        """Displays detailed artist information in the search tab results area."""
+        self.set_controls_enabled(True)
+        self._clear_search_results_layout()
+
+        if not artist_info:
+            self.status_label.setText("Status: Failed to load artist details.")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            error_label = QLabel("Could not load artist details.")
+            error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.search_results_layout.addWidget(error_label)
+        else:
+            artist_name = artist_info.get('name', 'N/A')
+            self.status_label.setText(f"Status: Displaying details for {artist_name}.")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+
+            # Create a widget to display artist info
+            artist_detail_widget = self.create_artist_detail_view(artist_info)
+            self.search_results_layout.addWidget(artist_detail_widget)
+            # TODO: Maybe fetch and add top tracks/albums below this widget too
+
+        self.api_worker = None
+
+    def create_artist_detail_view(self, artist_info):
+        """Creates a widget showing detailed artist info (image, name, bio, etc.)."""
+        detail_frame = QFrame()
+        detail_frame.setObjectName("artist_detail_view") # Optional styling
+        main_layout = QVBoxLayout(detail_frame)
+        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Top section: Image and Name/Stats
+        top_layout = QHBoxLayout()
+        top_layout.setSpacing(15)
+
+        image_label = QLabel()
+        img_size = 160 # Larger image for detail view
+        image_label.setFixedSize(img_size, img_size)
+        image_label.setStyleSheet("border: 1px solid #555; border-radius: 5px; background-color: #333;") # BG color for placeholder
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.request_image(artist_info.get('image_url'), image_label)
+        top_layout.addWidget(image_label)
+
+        name_stats_layout = QVBoxLayout()
+        name_label = QLabel(f"<b>{artist_info.get('name', 'N/A')}</b>")
+        name_label.setStyleSheet("font-size: 16pt; border: none; background: transparent;")
+        name_stats_layout.addWidget(name_label)
+
+        listeners = artist_info.get('listeners')
+        playcount = artist_info.get('playcount')
+        stats_text = f"{int(listeners):,} listeners | {int(playcount):,} plays" if listeners and playcount else "Stats N/A"
+        stats_label = QLabel(stats_text)
+        stats_label.setStyleSheet("color: #AAAAAA; border: none; background: transparent;")
+        name_stats_layout.addWidget(stats_label)
+
+        # Add Tags
+        tags = artist_info.get('tags', [])
+        if tags:
+            tags_label = QLabel(f"Tags: {', '.join(tags[:6])}{'...' if len(tags) > 6 else ''}")
+            tags_label.setWordWrap(True)
+            tags_label.setToolTip(", ".join(tags)) # Show all tags on hover
+            tags_label.setStyleSheet("color: #AAAAAA; font-size: 9pt; border: none; background: transparent;")
+            name_stats_layout.addWidget(tags_label)
+
+        name_stats_layout.addStretch()
+        top_layout.addLayout(name_stats_layout)
+        top_layout.addStretch()
+        main_layout.addLayout(top_layout)
+
+        # Bio Section
+        bio_summary = artist_info.get('bio_summary', 'No summary available.')
+        # Clean up common Last.fm link format if present
+        bio_summary = bio_summary.split('<a href=')[0].strip()
+
+        if bio_summary:
+            bio_group = QGroupBox("Bio Summary")
+            # bio_group.setFlat(True) # Alternative style
+            bio_layout = QVBoxLayout(bio_group)
+            bio_label = QLabel(bio_summary)
+            bio_label.setWordWrap(True)
+            bio_label.setStyleSheet("color: #D0D0D0; background: transparent;") # Ensure label readable
+            bio_layout.addWidget(bio_label)
+            # Add a Read More button? (Future enhancement: use bio_content)
+            main_layout.addWidget(bio_group)
+
+        # Placeholder for Top Tracks / Albums Section (Future Enhancement)
+        # ... add logic to fetch and display top tracks/albums here ...
+
+        main_layout.addStretch()
+        return detail_frame
 
     def search_error(self, error_message):
         self.status_label.setText("Status: Search Failed!")
         self.status_label.setStyleSheet("color: red; font-weight: bold;")
         self.set_controls_enabled(True)
         self.search_scrobble_button.setEnabled(False)
+        # Clear results on error too
+        self._clear_search_results_layout()
+        error_label = QLabel(f"Error: {error_message}")
+        error_label.setStyleSheet("color: red;")
+        self.search_results_layout.addWidget(error_label)
+
         self.api_worker = None
         QMessageBox.critical(self, "Search Error", error_message)
 
-    def populate_scrobble_from_search(self, item):
-        track_data = item.data(Qt.ItemDataRole.UserRole)
+    def populate_scrobble_from_search(self, track_data):
+        # This method is now called with track_data directly from double-click
+        if not track_data:
+            print("Warning: populate_scrobble_from_search called with empty track_data")
+            return
+
+        # Clear preview image on scrobble tab initially
+        self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "Fetching..."))
+
+        artist = track_data.get('artist', '')
+        track_name = track_data.get('name', '')
+
+        if not artist or not track_name:
+            QMessageBox.warning(self, "Data Error", "Selected track data is missing artist or track name.")
+            self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "Error"))
+            return
+
+        # Set status while fetching details
+        self.status_label.setText(f"Status: Fetching detailed information for '{track_name}'...")
+        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+        # Disable controls slightly differently - allow switching tabs maybe?
+        # self.set_controls_enabled(False)
+
+        # Create a worker to fetch detailed track info (needed for album cover URL)
+        # Use track_data as fallback info
+        self.api_worker = ApiWorker(get_track_info, artist, track_name)
+        # Pass track_data to the finished handler for fallback
+        self.api_worker.finished.connect(lambda result: self._populate_with_detailed_info(result if result else track_data))
+        self.api_worker.error.connect(lambda error_msg: self._populate_with_basic_info(track_data, error_msg))
+        self.api_worker.start()
+
+    def _populate_with_detailed_info(self, track_info):
+        """Populates the manual scrobble tab using detailed info (incl. cover). Falls back if needed."""
+        self.set_controls_enabled(True)
+
+        # Preferentially use data from track_info if it's the detailed dict
+        # Fallback to using track_info as the basic dict if detailed fetch failed but passed basic data
+        is_detailed = isinstance(track_info, dict) and 'album_title' in track_info # Heuristic
+
+        artist = track_info.get('artist', '')
+        track_name = track_info.get('name', '')
+        album_title = track_info.get('album_title') if is_detailed else None
+        image_url = track_info.get('image_url') # This should exist in both detailed and basic search results now
+
+        # Populate the scrobble form fields
+        self.artist_input.setText(artist)
+        self.track_input.setText(track_name)
+        if album_title:
+            self.album_input.setText(album_title)
+        elif not is_detailed: # If using basic data, clear album field
+             self.album_input.clear()
+        # else: keep potentially manually entered album if detailed fetch failed?
+        #     pass # Keep existing text
+
+        # Update image preview using the image_url found
+        if image_url:
+            self.request_image(image_url, self.manual_album_cover_label)
+        else:
+            self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "No Cover"))
+
+        status_msg = f"Status: Track details loaded for '{track_name}'" + (" (detailed)" if is_detailed else " (basic)")
+        self.status_label.setText(status_msg)
+        self.status_label.setStyleSheet("color: green; font-weight: bold;")
+
+        # Switch to scrobble tab and reset count
+        self.tabs.setCurrentWidget(self.scrobble_tab)
+        self.count_input.setValue(1)
+        self.api_worker = None
+
+    def _populate_with_basic_info(self, track_data, error_message=None):
+        """Fall back to using the basic search result data if detailed info fetch fails."""
+        self.set_controls_enabled(True)
+
+        if error_message:
+            print(f"Failed to get detailed track info: {error_message}")
+            QMessageBox.warning(self, "Fetch Warning", f"Could not fetch full track details: {error_message}. Using basic info.")
+
+        # Use the passed track_data (should be the basic result dict)
         if track_data:
             self.artist_input.setText(track_data.get('artist', ''))
             self.track_input.setText(track_data.get('name', ''))
-            # Try to find album info if available (might not be in search results)
-            # If album info is needed reliably, a track.getInfo call might be necessary
-            self.album_input.setText(track_data.get('album', '')) # Might be empty
-            self.tabs.setCurrentWidget(self.scrobble_tab) # Switch to scrobble tab
-            self.count_input.setValue(1) # Reset count on populate
+            self.album_input.clear() # Clear album, as basic search often lacks it
+            # Use image URL from basic data if available
+            image_url = track_data.get('image_url')
+            if image_url:
+                self.request_image(image_url, self.manual_album_cover_label)
+            else:
+                self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "No Cover"))
+
+            self.status_label.setText("Status: Basic track details loaded")
+            self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+        else:
+            # Should not happen if called correctly
+            print("Error: _populate_with_basic_info called with no track_data")
+            self.status_label.setText("Status: Error loading track details")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "Error"))
+
+        # Switch to scrobble tab and reset count
+        self.tabs.setCurrentWidget(self.scrobble_tab)
+        self.count_input.setValue(1)
+        self.api_worker = None
 
     def scrobble_selected_search_result(self):
-        selected_item = self.search_results_list.currentItem()
-        if not selected_item:
-            QMessageBox.warning(self, "No Selection", "Please select a track from the search results.")
+        # Use the selected item widget
+        if not self.selected_search_item_widget:
+             QMessageBox.warning(self, "No Selection", "Please select a track from the search results first by clicking on it.")
+             return
+
+        # Ensure the selected item is actually a track
+        if self.selected_search_item_widget.property("item_type") != "track":
+             QMessageBox.warning(self, "Invalid Selection", "Please select a track item to scrobble.")
+             return
+
+        track_data = self.selected_search_item_widget.property("track_data")
+        if not track_data:
+            QMessageBox.warning(self, "Error", "Could not retrieve data for the selected track.")
             return
 
-        track_data = selected_item.data(Qt.ItemDataRole.UserRole)
-        if not track_data:
-             QMessageBox.warning(self, "Error", "Could not retrieve data for the selected track.")
-             return
-
-        artist = track_data.get('artist')
-        track = track_data.get('name')
-        album = track_data.get('album') # Might be None or empty
+        artist = track_data.get('artist', '')
+        track_name = track_data.get('name', '')
         count = self.search_count_input.value()
 
-        if not artist or not track:
-             QMessageBox.warning(self, "Error", "Selected track data is incomplete.")
-             return
+        if not artist or not track_name:
+            QMessageBox.warning(self, "Error", "Selected track data is incomplete.")
+            return
 
         if count <= 0:
-             QMessageBox.warning(self, "Invalid Count", "Scrobble count must be at least 1.")
-             return
+            QMessageBox.warning(self, "Invalid Count", "Scrobble count must be at least 1.")
+            return
 
-        tracks_to_scrobble = [{
-            'artist': artist,
-            'track': track,
-            'album': album or None, # Ensure None if empty
-            'count': count
-        }]
+        # --- Display Confirmation --- #
+        self._clear_search_results_layout()
+        confirm_widget = self.create_confirmation_widget(track_data, count)
+        self.search_results_layout.addWidget(confirm_widget)
+        # -------------------------- #
 
-        # Use the generic scrobble task starter
-        self.start_scrobble_task(tracks_to_scrobble=tracks_to_scrobble)
+        # Set status while fetching details
+        self.status_label.setText(f"Status: Fetching detailed information for '{track_name}'...")
+        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+        self.set_controls_enabled(False) # Disable controls
 
+        # Fetch detailed track info to get accurate album information
+        # This worker reference will be overwritten by start_scrobble_task later
+        self.api_worker = ApiWorker(get_track_info, artist, track_name)
+        self.api_worker.finished.connect(lambda result: self._process_scrobble_with_details(result, count))
+        self.api_worker.error.connect(lambda error: self._scrobble_with_basic_info(track_data, count))
+        self.api_worker.start()
+
+    def create_confirmation_widget(self, track_data, count):
+        """Creates a widget confirming the track to be scrobbled."""
+        item_frame = QFrame()
+        item_frame.setObjectName("confirmation_item") # Different ID for potential styling
+        item_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        item_frame.setLineWidth(1)
+        # item_frame.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)) # Not clickable
+        item_frame.setProperty("item_type", "confirmation") # Identify item type
+
+        item_layout = QHBoxLayout(item_frame)
+        item_layout.setContentsMargins(8, 8, 8, 8)
+        item_layout.setSpacing(12)
+
+        # Image Label
+        image_label = QLabel()
+        image_size = PLACEHOLDER_SIZE
+        image_label.setFixedSize(image_size, image_size)
+        image_label.setStyleSheet("border: none; border-radius: 4px;")
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.request_image(track_data.get('image_url'), image_label)
+        item_layout.addWidget(image_label)
+
+        # Text Labels Layout
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(4)
+
+        track_name = track_data.get('name', 'N/A')
+        artist_name = track_data.get('artist', 'N/A')
+
+        prep_label = QLabel("Preparing to scrobble:")
+        prep_label.setStyleSheet("color: #AAAAAA; font-size: 9pt;")
+        track_label = QLabel(f"<b>{track_name}</b>")
+        artist_label = QLabel(artist_name)
+        artist_label.setObjectName("artist_label")
+        count_label = QLabel(f"({count} time{'' if count == 1 else 's'})" )
+        count_label.setStyleSheet("color: #AAAAAA; font-size: 9pt;")
+
+        text_layout.addWidget(prep_label)
+        text_layout.addWidget(track_label)
+        text_layout.addWidget(artist_label)
+        text_layout.addWidget(count_label)
+        text_layout.addStretch()
+
+        item_layout.addLayout(text_layout)
+        item_layout.addStretch()
+        return item_frame
+
+    def _process_scrobble_with_details(self, track_info, count):
+        """Process scrobbling with detailed track information"""
+        if track_info:
+            # Extract track details (Corrected Artist Extraction)
+            artist = track_info.get('artist', '') # Get artist name directly from the detailed info dict
+            track_name = track_info.get('name', '')
+            album_title = track_info.get('album_title') # Already extracted in get_track_info
+
+            if not artist or not track_name:
+                 # This case should be less likely if get_track_info succeeded
+                 print("Error: Detailed track info missing artist or track name.")
+                 # Fall back to basic info from the selected widget
+                 if self.selected_search_item_widget:
+                     track_data = self.selected_search_item_widget.property("track_data")
+                     self._scrobble_with_basic_info(track_data, count)
+                 else:
+                      self.set_controls_enabled(True)
+                      self.status_label.setText("Status: Scrobble failed - track details incomplete")
+                      self.status_label.setStyleSheet("color: red; font-weight: bold;")
+                      QMessageBox.warning(self, "Error", "Could not scrobble the track - details incomplete.")
+                 # Don't clear api_worker here, let the caller handle it or final step clear it
+                 return
+
+            tracks_to_scrobble = [{
+                'artist': artist,
+                'track': track_name,
+                'album': album_title,
+                'count': count
+            }]
+            self.start_scrobble_task(tracks_to_scrobble=tracks_to_scrobble)
+        else:
+            # Fall back to basic info if detailed info could not be retrieved
+            # Use data from the selected widget property
+            track_data = None
+            if self.selected_search_item_widget:
+                track_data = self.selected_search_item_widget.property("track_data")
+
+            if track_data:
+                 self._scrobble_with_basic_info(track_data, count)
+            else:
+                 self.set_controls_enabled(True)
+                 self.status_label.setText("Status: Scrobble failed - track details not available")
+                 self.status_label.setStyleSheet("color: red; font-weight: bold;")
+                 QMessageBox.warning(self, "Error", "Could not scrobble the track - details not available.")
+
+        # REMOVED: self.api_worker = None # Let start_scrobble_task manage the worker reference
 
     # --- Album Fetch Logic ---
-    def start_fetch_album_tracks_task(self):
+    def start_fetch_album_info_task(self):
+        print("DEBUG: start_fetch_album_info_task called") # <<< Added Debug Print
         artist = self.album_artist_input.text().strip()
         album = self.album_name_input.text().strip()
 
@@ -373,54 +1119,98 @@ class LastfmScrobblerApp(QWidget):
             QMessageBox.warning(self, "Input Missing", "Please enter both Artist and Album name.")
             return
 
-        self.status_label.setText(f"Status: Fetching tracks for '{album}'...")
-        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
-        self.set_controls_enabled(False) # Disable controls during fetch
-        self.album_tracks_list.clear()
-        self.scrobble_album_button.setEnabled(False) # Disable scrobble btn until fetch complete
-
-        # Store current artist/album for scrobbling later
+        self.status_label.setText(f"Status: Fetching info for album '{album}'...")
+        self.status_label.setStyleSheet("color: #6495ED; background-color: #333; padding: 4px; border-radius: 3px;") # Bluish
+        self.set_controls_enabled(False)
+        self._clear_album_tracks_layout()
+        self.album_cover_label.setPixmap(self.get_placeholder_pixmap(self.album_cover_label.sizeHint(), "Loading..."))
+        self.album_info_label.setText("Fetching...")
+        self.scrobble_album_button.setEnabled(False)
         self.current_album_artist = artist
         self.current_album_name = album
-
-        # Run fetch in worker thread
-        self.api_worker = ApiWorker(get_album_tracks, artist, album) # Use imported function
-        self.api_worker.finished.connect(self.album_tracks_finished)
-        self.api_worker.error.connect(self.album_tracks_error)
+        self.api_worker = ApiWorker(get_album_info, artist, album)
+        self.api_worker.finished.connect(self.album_info_finished)
+        self.api_worker.error.connect(self.album_info_error)
         self.api_worker.start()
 
-    def album_tracks_finished(self, track_list):
+    def album_info_finished(self, album_info): # Renamed handler, receives full dict
+        print(f"DEBUG: album_info_finished received type: {type(album_info)}, value: {album_info}") # <<< Added Debug Print
         self.set_controls_enabled(True) # Re-enable controls
 
-        if track_list is None:
-            # This means API call succeeded but album/tracks weren't found or list was empty
-            self.status_label.setText(f"Status: Album '{self.current_album_name}' not found or has no tracks listed.")
+        if album_info is None:
+            # This means API call succeeded but album wasn't found or other issue
+            self.status_label.setText(f"Status: Album '{self.current_album_name}' by '{self.current_album_artist}' not found.")
             self.status_label.setStyleSheet("color: orange; font-weight: bold;")
-            self.album_tracks_list.addItem("Album/Tracks not found.")
+            self._clear_album_tracks_layout()
+            self.album_tracks_layout.addWidget(QLabel("Album not found."))
+            self.album_cover_label.setText("Album not found") # Use setText for placeholder text
+            self.album_info_label.setText("")
             self.scrobble_album_button.setEnabled(False)
-            QMessageBox.warning(self, "Fetch Failed", f"Could not find tracks for album '{self.current_album_name}' by '{self.current_album_artist}'. Check spelling or Last.fm listing.")
-        elif not track_list: # Empty list returned explicitly
-             self.status_label.setText(f"Status: Found album '{self.current_album_name}' but it has no tracks listed.")
-             self.status_label.setStyleSheet("color: orange; font-weight: bold;")
-             self.album_tracks_list.addItem("No tracks listed for this album.")
-             self.scrobble_album_button.setEnabled(False)
+            QMessageBox.warning(self, "Fetch Failed", f"Could not find album '{self.current_album_name}' by '{self.current_album_artist}'. Check spelling or Last.fm listing.")
+        # Add explicit check if it's a dictionary before using .get()
+        elif isinstance(album_info, dict):
+            # Album info found, extract tracks and display info
+            track_list = album_info.get('tracks', []) # Get track list (list of dicts)
+            fetched_artist = album_info.get('artist', self.current_album_artist)
+            fetched_album = album_info.get('name', self.current_album_name)
+            image_url = album_info.get('image_url')
+
+            # Update album info display
+            self.request_image(image_url, self.album_cover_label)
+            self.album_info_label.setText(f"<b>{fetched_album}</b>\nby {fetched_artist}")
+            # Store potentially corrected names
+            self.current_album_artist = fetched_artist
+            self.current_album_name = fetched_album
+
+            self._clear_album_tracks_layout()
+            if not track_list:
+                 self.status_label.setText(f"Status: Found album '{fetched_album}' but it has no tracks listed.")
+                 self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+                 self.album_tracks_layout.addWidget(QLabel("No tracks listed for this album."))
+                 self.scrobble_album_button.setEnabled(False)
+            else:
+                self.status_label.setText(f"Status: Fetched {len(track_list)} tracks for '{fetched_album}'.")
+                self.status_label.setStyleSheet("color: green; font-weight: bold;")
+                for i, track_dict in enumerate(track_list):
+                     track_name = track_dict.get('name', 'Unknown Track')
+                     track_label = QLabel(f"{i+1}. {track_name}")
+                     track_label.setProperty("track_name", track_name) # Store name for scrobbling
+                     self.album_tracks_layout.addWidget(track_label)
+                # Enable scrobble button only if authenticated and tracks were found
+                self.scrobble_album_button.setEnabled(bool(self.session_key))
         else:
-            self.status_label.setText(f"Status: Fetched {len(track_list)} tracks for '{self.current_album_name}'.")
-            self.status_label.setStyleSheet("color: green; font-weight: bold;")
-            for track_name in track_list:
-                self.album_tracks_list.addItem(QListWidgetItem(track_name)) # Use QListWidgetItem
-            # Enable scrobble button only if authenticated and tracks were found
-            self.scrobble_album_button.setEnabled(bool(self.session_key))
+            # Handle unexpected type (like the string that caused the error)
+            print(f"ERROR: album_info_finished received unexpected type: {type(album_info)}")
+            self.status_label.setText("Status: Error processing album info.")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            self._clear_album_tracks_layout()
+            self.album_tracks_layout.addWidget(QLabel("Error processing result."))
+            self.album_cover_label.setText("Error")
+            self.album_info_label.setText("Error")
+            self.scrobble_album_button.setEnabled(False)
+            QMessageBox.critical(self, "Processing Error", f"Received unexpected data type when fetching album info: {type(album_info)}")
+
 
         self.api_worker = None # Clear worker reference
 
-    def album_tracks_error(self, error_message):
-        self.status_label.setText("Status: Failed to fetch album tracks!")
+    def album_info_error(self, error_message): # Renamed handler
+        self.status_label.setText("Status: Failed to fetch album info!")
         self.status_label.setStyleSheet("color: red; font-weight: bold;")
         self.set_controls_enabled(True)
         self.scrobble_album_button.setEnabled(False)
+        self._clear_album_tracks_layout()
+        self.album_tracks_layout.addWidget(QLabel(f"Error: {error_message}"))
+        self.album_cover_label.setText("Error fetching")
+        self.album_info_label.setText("")
         self.api_worker = None
         QMessageBox.critical(self, "Fetch Error", error_message)
+
+    def _clear_album_tracks_layout(self):
+        """Removes all widgets from the album tracks layout."""
+        while self.album_tracks_layout.count():
+            child = self.album_tracks_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
 
     # --- Album Scrobble Logic ---
     def start_scrobble_album_task(self):
@@ -428,16 +1218,32 @@ class LastfmScrobblerApp(QWidget):
              QMessageBox.critical(self, "Error", "Not authenticated.")
              return
 
-        if self.album_tracks_list.count() == 0 or self.album_tracks_list.item(0).text() in ["Album/Tracks not found.", "No tracks listed for this album."]:
-            QMessageBox.warning(self, "No Tracks", "No tracks fetched to scrobble. Please fetch tracks first.")
-            return
+        # --- Refined Check for Valid Tracks --- #
+        has_valid_tracks = False
+        if self.album_tracks_layout.count() > 0:
+            first_widget = self.album_tracks_layout.itemAt(0).widget()
+            # Check if the first widget is a QLabel *and* has our custom track_name property
+            if isinstance(first_widget, QLabel) and first_widget.property("track_name") is not None:
+                has_valid_tracks = True
 
-        artist = self.current_album_artist # Use stored artist/album
+        if not has_valid_tracks:
+            QMessageBox.warning(self, "No Tracks", "No valid tracks fetched to scrobble. Please fetch album info first.")
+            return
+        # --- End Refined Check --- #
+
+        # Check if tracks layout is empty or contains only info messages (Old Check - Replaced)
+        # if self.album_tracks_layout.count() == 0 or isinstance(self.album_tracks_layout.itemAt(0).widget(), QLabel):
+        #     first_widget_text = self.album_tracks_layout.itemAt(0).widget().text() if self.album_tracks_layout.count() > 0 else ""
+        #     if "not found" in first_widget_text or "No tracks listed" in first_widget_text or "Error:" in first_widget_text:
+        #         QMessageBox.warning(self, "No Tracks", "No valid tracks fetched to scrobble. Please fetch album info first.")
+        #         return
+
+        artist = self.current_album_artist # Use stored artist/album (potentially corrected by API)
         album = self.current_album_name
         count_per_track = self.album_count_input.value()
 
         if not artist or not album:
-             QMessageBox.critical(self, "Error", "Missing album artist or name. Please fetch tracks again.")
+             QMessageBox.critical(self, "Error", "Missing album artist or name. Please fetch album info again.")
              return
 
         if count_per_track <= 0:
@@ -445,23 +1251,27 @@ class LastfmScrobblerApp(QWidget):
              return
 
         tracks_to_scrobble = []
-        for i in range(self.album_tracks_list.count()):
-            track_item = self.album_tracks_list.item(i)
-            track_name = track_item.text()
-            tracks_to_scrobble.append({
-                'artist': artist,
-                'track': track_name,
-                'album': album,
-                'count': count_per_track
-            })
+        # Iterate through widgets in the layout
+        for i in range(self.album_tracks_layout.count()):
+            widget = self.album_tracks_layout.itemAt(i).widget()
+            # Ensure it's one of our track labels (which have the track_name property)
+            track_name = widget.property("track_name") # Get property directly
+            if isinstance(widget, QLabel) and track_name is not None:
+                # track_name = widget.property("track_name") # Already got it
+                tracks_to_scrobble.append({
+                    'artist': artist,
+                    'track': track_name,
+                    'album': album,
+                    'count': count_per_track
+                })
 
         if not tracks_to_scrobble:
-             QMessageBox.warning(self, "Error", "Could not prepare track list for scrobbling.")
+             # This should be less likely now due to the check at the start
+             QMessageBox.warning(self, "Error", "Could not prepare track list for scrobbling (no valid tracks found in list).")
              return
 
         # Use the existing generic scrobble task function
         self.start_scrobble_task(tracks_to_scrobble=tracks_to_scrobble)
-
 
     # --- Generic Scrobble Task Starter ---
     def start_scrobble_task(self, tracks_to_scrobble=None):
@@ -512,6 +1322,9 @@ class LastfmScrobblerApp(QWidget):
         if reply == QMessageBox.StandardButton.No:
             self.status_label.setText("Status: Scrobble cancelled.")
             self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+            # If cancelled here, should clear confirmation widget in search tab too
+            if self.tabs.currentWidget() == self.search_tab:
+                self._clear_search_results_layout()
             return
 
         self.status_label.setText("Status: Scrobbliing...")
@@ -521,26 +1334,29 @@ class LastfmScrobblerApp(QWidget):
         # Setup and show progress dialog
         self.progress_dialog = QProgressDialog("Scrobbling...", "Cancel", 0, total_scrobbles, self)
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress_dialog.setAutoClose(False) # Keep open until explicitly closed or cancelled
-        self.progress_dialog.setAutoReset(False) # Keep value after finishing unless reset
+        self.progress_dialog.setAutoClose(False)
+        self.progress_dialog.setAutoReset(False)
         self.progress_dialog.setValue(0)
-        self.progress_dialog.canceled.connect(self.cancel_task) # Connect cancel signal
+        self.progress_dialog.canceled.connect(self.cancel_task)
         self.progress_dialog.show()
 
-
         # Run scrobbling in worker thread
-        self.api_worker = ApiWorker(scrobble_multiple_tracks, # Use imported function
+        self.api_worker = ApiWorker(scrobble_multiple_tracks,
                                     tracks_info=tracks_to_scrobble,
                                     session_key=self.session_key,
-                                    base_timestamp=int(time.time())) # Use current time as base
+                                    base_timestamp=int(time.time()))
         self.api_worker.finished.connect(self.scrobble_finished)
         self.api_worker.error.connect(self.scrobble_error)
         self.api_worker.progress.connect(self.update_progress)
         self.api_worker.start()
 
     def scrobble_finished(self, result):
+        # Clear confirmation widget from search tab if present
+        if self.tabs.currentWidget() == self.search_tab:
+             self._clear_search_results_layout()
+
         if self.progress_dialog:
-            self.progress_dialog.close() # Close progress dialog cleanly
+            self.progress_dialog.close()
 
         if result is None: # Should not happen if not cancelled, but check
              self.status_label.setText(f"Status: Scrobble finished unexpectedly.")
@@ -553,16 +1369,19 @@ class LastfmScrobblerApp(QWidget):
             QMessageBox.information(self, "Scrobble Complete", f"Successfully sent {success_count} scrobbles.\n{failure_count} scrobbles failed or were ignored.")
 
         self.set_controls_enabled(True)
-        self.api_worker = None # Clear worker reference
-
+        self.api_worker = None # Clear worker reference *after* task is finished
 
     def scrobble_error(self, error_message):
+        # Clear confirmation widget from search tab if present
+        if self.tabs.currentWidget() == self.search_tab:
+             self._clear_search_results_layout()
+
         if self.progress_dialog:
             self.progress_dialog.close()
         self.status_label.setText("Status: Scrobble Failed!")
         self.status_label.setStyleSheet("color: red; font-weight: bold;")
         self.set_controls_enabled(True)
-        self.api_worker = None
+        self.api_worker = None # Clear worker reference *after* task error
         QMessageBox.critical(self, "Scrobble Error", error_message)
 
     def update_progress(self, current_count, total_count, message):
@@ -585,81 +1404,250 @@ class LastfmScrobblerApp(QWidget):
 
     # --- Cancellation Logic ---
     def cancel_task(self):
+        """Requests interruption for the API worker and aborts pending image downloads."""
+        interrupted = False
         if self.api_worker and self.api_worker.isRunning():
-            print("Attempting to cancel task...")
+            print("Attempting to cancel API task...")
             self.api_worker.requestInterruption() # Request interruption
-
-            # Don't terminate forcefully here, let the thread finish if it can
+            interrupted = True
+            # Don't terminate forcefully here, let the thread finish if it can check
             # The worker thread now checks self._is_interruption_requested
 
+        # Abort pending image downloads
+        if self.pending_replies:
+             print(f"Aborting {len(self.pending_replies)} pending image downloads...")
+             # Iterate over a copy of the set as abort() might trigger finished signal
+             # which modifies the set via handle_image_reply
+             replies_to_abort = list(self.pending_replies)
+             for reply in replies_to_abort:
+                 if reply and reply.isRunning():
+                     print(f"  Aborting: {reply.url().toString()}")
+                     reply.abort() # This will emit finished with OperationCanceledError
+                     # handle_image_reply will remove it from self.pending_replies
+             interrupted = True # Mark as interrupted even if only images were cancelled
+
+        if interrupted:
             self.status_label.setText("Status: Task Cancellation Requested")
             self.status_label.setStyleSheet("color: orange; font-weight: bold;")
             # Re-enable controls immediately upon requesting cancel
             self.set_controls_enabled(True)
-            if self.progress_dialog:
+            if self.progress_dialog and self.progress_dialog.isVisible():
                 self.progress_dialog.setLabelText("Cancelling...")
-                # Don't close immediately, let the worker finish/error out if needed
-                # self.progress_dialog.close() # Moved closing to finished/error handlers
-            # Don't clear worker reference immediately, let signals fire
-            # self.api_worker = None
-            print("Task cancellation requested. Waiting for thread to acknowledge.")
-        elif self.progress_dialog:
-             # If progress dialog exists but worker doesn't (shouldn't happen often)
+                # The finished/error signal from the worker will close the dialog
+            print("Task cancellation requested. Waiting for thread/network replies to acknowledge.")
+        elif self.progress_dialog and self.progress_dialog.isVisible():
+             # If progress dialog exists but no worker/replies (shouldn't happen often)
              self.progress_dialog.close()
-
+        # else: No task was running
 
     # --- Utility Functions ---
-    def set_controls_enabled(self, enabled):
+    def set_controls_enabled(self, enabled, keep_search_inputs=False):
         is_authenticated = bool(self.session_key)
-        has_search_results = self.search_results_list.count() > 0 and self.search_results_list.item(0).text() != "No results found."
-        has_album_tracks = self.album_tracks_list.count() > 0 and self.album_tracks_list.item(0).text() not in ["Album/Tracks not found.", "No tracks listed for this album."]
+
+        # --- Check Search Results State (Still needed for Scrobble Button) --- #
+        search_results_are_tracks = False
+        search_results_are_artists = False
+        search_results_is_artist_detail = False
+        if self.search_results_layout.count() > 0:
+            first_widget = self.search_results_layout.itemAt(0).widget()
+            if isinstance(first_widget, QFrame):
+                item_type = first_widget.property("item_type")
+                if item_type == "track":
+                    search_results_are_tracks = True
+                elif item_type == "artist":
+                    search_results_are_artists = True
+                elif first_widget.objectName() == "artist_detail_view":
+                    search_results_is_artist_detail = True
+
+        # --- Check Album Tracks State (Still needed for Scrobble Button) --- #
+        has_real_album_tracks = False
+        if self.album_tracks_layout.count() > 0:
+            first_album_widget = self.album_tracks_layout.itemAt(0).widget()
+            if isinstance(first_album_widget, QLabel) and first_album_widget.property("track_name") is not None:
+                has_real_album_tracks = True
+
+        # --- Enable/Disable Controls --- #
+        # print(f"DEBUG: set_controls_enabled(enabled={enabled}, is_auth={is_authenticated}, search_tracks={search_results_are_tracks}, album_tracks={has_real_album_tracks})")
 
         # General Auth Button
-        # self.auth_button.setEnabled(enabled) # Keep auth button logic separate (handled in auth methods)
+        self.auth_button.setEnabled(enabled and not is_authenticated)
+        self.auth_button.setText("Authenticated" if is_authenticated else "Authenticate")
 
         # Scrobble Tab
         self.artist_input.setEnabled(enabled)
         self.track_input.setEnabled(enabled)
         self.album_input.setEnabled(enabled)
+        self.fetch_manual_album_info_button.setEnabled(enabled and is_authenticated)
         self.count_input.setEnabled(enabled)
         self.scrobble_button.setEnabled(enabled and is_authenticated)
 
         # Search Tab
-        self.search_artist_input.setEnabled(enabled)
-        self.search_track_input.setEnabled(enabled)
-        self.search_button.setEnabled(enabled)
-        self.search_results_list.setEnabled(enabled)
-        self.search_count_input.setEnabled(enabled and has_search_results)
-        self.search_scrobble_button.setEnabled(enabled and is_authenticated and has_search_results and self.search_results_list.currentItem() is not None) # Enable only if item selected too
+        self.search_artist_input.setEnabled(enabled or keep_search_inputs)
+        self.search_track_input.setEnabled(enabled or keep_search_inputs)
+        self.search_results_scroll_area.setEnabled(enabled)
+
+        # SIMPLIFIED: Enable search count input whenever authenticated and not busy
+        search_count_should_be_enabled = enabled and is_authenticated
+        # print(f"DEBUG: Setting search_count_input enabled: {search_count_should_be_enabled}")
+        self.search_count_input.setEnabled(search_count_should_be_enabled)
+
+        # Enable search scrobble button ONLY if a track is selected
+        can_scrobble_selected = isinstance(self.selected_search_item_widget, QFrame) and self.selected_search_item_widget.property("item_type") == "track"
+        search_scrobble_should_be_enabled = enabled and is_authenticated and can_scrobble_selected
+        # print(f"DEBUG: Setting search_scrobble_button enabled: {search_scrobble_should_be_enabled}")
+        self.search_scrobble_button.setEnabled(search_scrobble_should_be_enabled)
 
         # Album Tab
         self.album_artist_input.setEnabled(enabled)
         self.album_name_input.setEnabled(enabled)
         self.fetch_tracks_button.setEnabled(enabled and is_authenticated)
-        self.album_tracks_list.setEnabled(enabled)
-        self.album_count_input.setEnabled(enabled and has_album_tracks)
-        self.scrobble_album_button.setEnabled(enabled and is_authenticated and has_album_tracks)
+        self.album_tracks_scroll_area.setEnabled(enabled)
 
-        # Re-enable search scrobble button based on selection change
-        self.search_results_list.currentItemChanged.connect(
-            lambda current, previous: self.search_scrobble_button.setEnabled(
-                enabled and is_authenticated and has_search_results and current is not None
-            )
-        )
+        # SIMPLIFIED: Enable album count input whenever authenticated and not busy
+        album_count_should_be_enabled = enabled and is_authenticated
+        # print(f"DEBUG: Setting album_count_input enabled: {album_count_should_be_enabled}")
+        self.album_count_input.setEnabled(album_count_should_be_enabled)
 
+        # Enable album scrobble button ONLY if real tracks are loaded
+        album_scrobble_should_be_enabled = enabled and is_authenticated and has_real_album_tracks
+        # print(f"DEBUG: Setting scrobble_album_button enabled: {album_scrobble_should_be_enabled}")
+        self.scrobble_album_button.setEnabled(album_scrobble_should_be_enabled)
+
+    # --- Dynamic Search Logic ---
+    def trigger_dynamic_search(self):
+        """Triggered when the search timer times out, performs the actual search."""
+        artist = self.search_artist_input.text().strip()
+        track = self.search_track_input.text().strip()
+
+        # We need at least an artist name to search
+        if not artist:
+            self._clear_search_results_layout()
+            no_input_label = QLabel("Please enter an artist name to start searching.")
+            no_input_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.search_results_layout.addWidget(no_input_label)
+            self.selected_search_item_widget = None # Reset selection
+            self.search_scrobble_button.setEnabled(False)
+            return
+
+        self.status_label.setText(f"Status: Searching...")
+        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+
+        # Disable scrobble button during search
+        self.search_scrobble_button.setEnabled(False)
+        self.set_controls_enabled(False, keep_search_inputs=True) # Keep search inputs enabled
+
+        # Determine if searching for artists or tracks based on input
+        if track: # If track is specified, always search tracks
+            print(f"Searching TRACK: {track} by {artist}")
+            self.api_worker = ApiWorker(search_track, artist, track)
+            self.api_worker.finished.connect(self.search_tracks_finished)
+        else: # If only artist is specified, search artists
+            print(f"Searching ARTIST: {artist}")
+            self.api_worker = ApiWorker(search_artist, artist)
+            self.api_worker.finished.connect(self.search_artists_finished)
+
+        self.api_worker.error.connect(self.search_error)
+        self.api_worker.start()
+
+    def on_search_text_changed(self):
+        """Called when either search field text changes. Starts/restarts the search timer."""
+        # Cancel any existing worker doing a previous search
+        if self.api_worker and self.api_worker.isRunning():
+            print("Search text changed, cancelling previous API worker...")
+            self.cancel_task() # Request interruption of the API call
+
+        # Cancel any existing search timer
+        self.search_timer.stop()
+
+        # Start timer with a delay of 500ms
+        self.search_timer.start(500)
+
+        # Update status to show we're preparing to search
+        self.status_label.setText("Status: Typing...")
+        self.status_label.setStyleSheet("color: gray; font-weight: normal;")
 
     def closeEvent(self, event):
-        # Ensure worker thread is stopped if app closes
-        if self.api_worker and self.api_worker.isRunning():
-            print("Window closing, requesting task interruption...")
-            self.cancel_task() # Try to clean up
+        # Ensure worker thread and network requests are stopped if app closes
+        if (self.api_worker and self.api_worker.isRunning()) or self.pending_replies:
+            print("Window closing, requesting task/download interruption...")
+            self.cancel_task() # Try to clean up API worker and image downloads
             # Give it a moment to potentially stop
-            self.api_worker.wait(500) # Wait half a second
+            if self.api_worker:
+                 self.api_worker.wait(300) # Wait short time
+            # Check again for worker
             if self.api_worker and self.api_worker.isRunning():
                  print("Worker still running after wait, terminating forcefully.")
-                 self.api_worker.terminate() # Force stop if still running (use cautiously)
+                 self.api_worker.terminate() # Force stop if still running
                  self.api_worker.wait() # Wait for termination
         event.accept()
+
+    # --- Manual Scrobble Tab Logic ---
+    def fetch_album_info_for_manual_scrobble(self):
+        artist = self.artist_input.text().strip()
+        album = self.album_input.text().strip()
+
+        if not artist or not album:
+            QMessageBox.warning(self, "Input Missing", "Please enter both Artist and Album name to fetch info.")
+            return
+
+        self.status_label.setText(f"Status: Fetching info for album '{album}'...")
+        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+        self.set_controls_enabled(False) # Disable controls during fetch
+        self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "Fetching..."))
+
+        # Run fetch in worker thread
+        self.api_worker = ApiWorker(get_album_info, artist, album)
+        self.api_worker.finished.connect(self.manual_album_info_finished)
+        self.api_worker.error.connect(self.manual_album_info_error)
+        self.api_worker.start()
+
+    def manual_album_info_finished(self, album_info):
+        self.set_controls_enabled(True) # Re-enable controls
+
+        if album_info and album_info.get('image_url'):
+            image_url = album_info.get('image_url')
+            fetched_artist = album_info.get('artist')
+            fetched_album = album_info.get('name')
+
+            self.request_image(image_url, self.manual_album_cover_label)
+            self.status_label.setText(f"Status: Album info loaded for '{fetched_album}'.")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+            # Optionally update artist/album fields if they were different or empty
+            # self.artist_input.setText(fetched_artist)
+            # self.album_input.setText(fetched_album)
+        elif album_info: # Found info but no image
+             fetched_album = album_info.get('name', self.album_input.text().strip())
+             self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "No Cover"))
+             self.status_label.setText(f"Status: Album info found for '{fetched_album}', but no cover image.")
+             self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+        else:
+            # Album not found or error occurred (error signal should handle API errors)
+            self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "Not Found"))
+            self.status_label.setText(f"Status: Could not find album info.")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            QMessageBox.warning(self, "Fetch Failed", f"Could not find album info for '{self.album_input.text().strip()}' by '{self.artist_input.text().strip()}'.")
+
+        self.api_worker = None
+
+    def manual_album_info_error(self, error_message):
+        self.set_controls_enabled(True)
+        self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "Error"))
+        self.status_label.setText("Status: Failed to fetch album info!")
+        self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.api_worker = None
+        QMessageBox.critical(self, "Fetch Error", error_message)
+
+    # --- Search Logic --- #
+    def _clear_search_results_layout(self):
+        """Removes all widgets from the search results layout."""
+        # Also reset selection state
+        self.selected_search_item_widget = None
+        self.search_scrobble_button.setEnabled(False)
+        # Clear layout items
+        while self.search_results_layout.count():
+            child = self.search_results_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
 
 
 # --- Application Entry Point ---
@@ -676,6 +1664,273 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     # Set Fusion style for a modern look
     app.setStyle('Fusion')
+
+    # --- Enhanced Modern Stylesheet --- #
+    app.setStyleSheet("""
+        /* Global Settings */
+        QWidget {
+            font-family: "Segoe UI", Frutiger, "Frutiger Linotype", "Dejavu Sans", "Helvetica Neue", Arial, sans-serif;
+            font-size: 10pt;
+            color: #E8E8E8; /* Lighter base text */
+            background-color: #1E1E1E; /* Darker background */
+        }
+
+        /* Group Boxes */
+        QGroupBox {
+            background-color: #2A2A2A; /* Slightly lighter group background */
+            border: 1px solid #3C3C3C;
+            border-radius: 6px;
+            margin-top: 20px; /* Increased margin for title spacing */
+            padding-top: 10px; /* Padding inside the box, below title */
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 5px 15px; /* More padding for title */
+            margin-left: 10px;
+            border-radius: 4px;
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                              stop:0 #3A3A3A, stop:1 #303030); /* Subtle gradient */
+            color: #CCCCCC;
+            font-weight: bold;
+        }
+
+        /* Labels */
+        QLabel {
+            background-color: transparent;
+            color: #CFCFCF; /* Standard label color */
+            padding: 2px;
+        }
+        QLabel#status_label { /* Specific styling for status label */
+            font-weight: bold;
+            padding: 5px;
+            border-radius: 4px;
+            /* Background/color set dynamically */
+        }
+
+        /* LineEdits and SpinBoxes */
+        QLineEdit, QSpinBox {
+            background-color: #2F2F2F;
+            border: 1px solid #4A4A4A;
+            border-radius: 4px;
+            padding: 5px 8px;
+            color: #F0F0F0;
+            selection-background-color: #0078D7; /* Selection color */
+            selection-color: #FFFFFF;
+        }
+        QLineEdit:focus, QSpinBox:focus {
+            border: 1px solid #0078D7; /* Brighter focus border */
+            background-color: #333333;
+        }
+        QLineEdit::placeholderText {
+            color: #777777;
+        }
+
+        /* Buttons */
+        QPushButton {
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                              stop:0 #4D4D4D, stop:1 #424242); /* Button gradient */
+            color: #FFFFFF;
+            border: 1px solid #5A5A5A;
+            border-radius: 4px;
+            padding: 7px 15px;
+            min-width: 90px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                              stop:0 #5D5D5D, stop:1 #525252);
+            border: 1px solid #6A6A6A;
+        }
+        QPushButton:pressed {
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                              stop:0 #404040, stop:1 #383838);
+            border: 1px solid #4A4A4A;
+            padding-top: 8px; /* Pressed effect */
+            padding-bottom: 6px;
+        }
+        QPushButton:disabled {
+            background-color: #353535;
+            color: #777777;
+            border: 1px solid #444444;
+        }
+
+        /* Tabs */
+        QTabWidget::pane {
+            border: 1px solid #3C3C3C;
+            border-top: none; /* Pane border only on sides/bottom */
+            background-color: #252525; /* Slightly darker pane */
+            border-bottom-left-radius: 6px;
+            border-bottom-right-radius: 6px;
+        }
+        QTabWidget::tab-bar {
+            left: 5px; /* Indent tab bar slightly */
+            alignment: left;
+        }
+        QTabBar::tab {
+            background: #3A3A3A;
+            border: 1px solid #4A4A4A;
+            border-bottom: none;
+            padding: 8px 15px;
+            margin-right: 3px;
+            border-top-left-radius: 5px;
+            border-top-right-radius: 5px;
+            color: #BBBBBB;
+        }
+        QTabBar::tab:selected {
+            background: #252525; /* Match pane background */
+            margin-bottom: -1px; /* Overlap pane border */
+            color: #FFFFFF;
+            border: 1px solid #3C3C3C; /* Match pane border */
+            border-bottom: 1px solid #252525; /* Hide bottom border */
+            font-weight: bold;
+        }
+        QTabBar::tab:!selected:hover {
+            background: #454545;
+            color: #DEDEDE;
+        }
+
+        /* QListWidget (used for Album Tracks only now, maybe remove later) */
+        QListWidget {
+            background-color: #2F2F2F;
+            border: 1px solid #4A4A4A;
+            border-radius: 4px;
+            alternate-background-color: #333333; /* Subtle row difference */
+        }
+        QListWidget::item {
+            padding: 6px 4px;
+            border-bottom: 1px solid #383838; /* Separator line */
+        }
+        QListWidget::item:selected {
+            background-color: #005A9E; /* Darker selection blue */
+            color: #FFFFFF;
+            border: none; /* Remove border on selected item */
+            padding-left: 6px; /* Indent selected */
+        }
+        QListWidget::item:hover {
+            background-color: #3D3D3D;
+        }
+
+        /* Scroll Area and Contents */
+        QScrollArea {
+            border: none;
+            background-color: transparent; /* Inherit background */
+        }
+        /* Style the QWidget *inside* the QScrollArea if needed */
+        #search_results_widget, #album_tracks_widget { /* Use object names */
+            background-color: #252525; /* Match tab pane */
+        }
+
+        /* Search Result Item Frame */
+        QFrame#search_result_item {
+            background-color: #2F2F2F;
+            border: 1px solid #404040;
+            border-radius: 5px;
+            padding: 5px;
+        }
+        QFrame#search_result_item:hover {
+            background-color: #383838;
+            border: 1px solid #505050;
+        }
+        QFrame#search_result_item[selected="true"] {
+            background-color: #005A9E;
+            border: 1px solid #0078D7;
+        }
+        QFrame#search_result_item QLabel { /* Labels inside the frame */
+            background-color: transparent;
+            border: none;
+        }
+        QFrame#search_result_item[selected="true"] QLabel {
+            color: #FFFFFF;
+        }
+        QFrame#search_result_item[selected="true"] QLabel#artist_label {
+            color: #DDDDDD; /* Slightly dimmer artist in selected item */
+        }
+
+        /* Album Track Labels (inside scroll area) */
+        #album_tracks_widget QLabel {
+            padding: 4px 6px;
+            border-bottom: 1px solid #333333;
+        }
+        #album_tracks_widget QLabel:hover {
+            background-color: #383838;
+        }
+
+
+        /* Scroll Bars */
+        QScrollBar:vertical {
+            border: none;
+            background: #2A2A2A;
+            width: 12px;
+            margin: 0px 0px 0px 0px;
+        }
+        QScrollBar::handle:vertical {
+            background: #555555;
+            min-height: 25px;
+            border-radius: 6px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #656565;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+            background: none;
+        }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            background: none;
+        }
+        QScrollBar:horizontal {
+            border: none;
+            background: #2A2A2A;
+            height: 12px;
+            margin: 0px 0px 0px 0px;
+        }
+        QScrollBar::handle:horizontal {
+            background: #555555;
+            min-width: 25px;
+            border-radius: 6px;
+        }
+        QScrollBar::handle:horizontal:hover {
+            background: #656565;
+        }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+            width: 0px;
+            background: none;
+        }
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+            background: none;
+        }
+
+        /* Progress Dialog */
+        QProgressDialog {
+            background-color: #2A2A2A;
+            border: 1px solid #4A4A4A;
+            border-radius: 5px;
+        }
+        QProgressDialog QLabel {
+            color: #E0E0E0;
+            padding: 5px;
+        }
+        QProgressBar {
+            border: 1px solid #5A5A5A;
+            border-radius: 4px;
+            text-align: center;
+            background-color: #3A3A3A;
+            color: #FFFFFF; /* Text on progress bar */
+        }
+        QProgressBar::chunk {
+            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0078D7, stop:1 #005A9E); /* Blue gradient chunk */
+            border-radius: 3px;
+            margin: 1px; /* Margin around the chunk */
+        }
+        QProgressDialog QPushButton { /* Style cancel button */
+            /* Inherits general button style, add specifics if needed */
+            min-width: 70px; /* Smaller cancel button */
+            padding: 5px 10px;
+        }
+
+    """)
+
     ex = LastfmScrobblerApp()
     ex.show()
     sys.exit(app.exec())

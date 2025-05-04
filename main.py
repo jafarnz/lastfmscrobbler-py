@@ -5,6 +5,7 @@ import time
 import hashlib
 import requests
 from dotenv import load_dotenv
+import requests_cache
 
 load_dotenv() # Load environment variables from .env file
 
@@ -15,6 +16,11 @@ PASSWORD = os.getenv('LASTFM_PASSWORD')
 
 API_URL = 'http://ws.audioscrobbler.com/2.0/'
 
+# --- Cache Setup ---
+# Cache API responses for 1 hour to reduce load and speed up repeated requests
+requests_cache.install_cache('lastfm_cache', backend='sqlite', expire_after=3600)
+print("Requests caching enabled.")
+
 # --- Helper Functions ---
 
 def _get_api_signature(params):
@@ -24,8 +30,21 @@ def _get_api_signature(params):
     param_string += API_SECRET
     return hashlib.md5(param_string.encode('utf-8')).hexdigest()
 
+def _extract_image_url(image_data, size_preference=['extralarge', 'large', 'medium', 'small']):
+    """Extracts the best available image URL from Last.fm image data."""
+    if not isinstance(image_data, list):
+        return None
+    image_urls = {img['size']: img.get('#text') for img in image_data if '#text' in img and img.get('#text')}
+    for size in size_preference:
+        if size in image_urls:
+            return image_urls[size]
+    # Fallback to the first available URL if preferred sizes are not found
+    if image_urls:
+        return next(iter(image_urls.values()))
+    return None
+
 def _make_api_request(method, http_method='GET', params=None, requires_signature=False, requires_session=False, session_key=None):
-    """Makes a generic request to the Last.fm API."""
+    """Makes a generic request to the Last.fm API (now cached)."""
     if params is None:
         params = {}
 
@@ -56,10 +75,16 @@ def _make_api_request(method, http_method='GET', params=None, requires_signature
     try:
         if http_method.upper() == 'POST':
             # Use request_params which now includes api_sig and format
-            response = requests.post(API_URL, data=request_params)
+            # For POST requests that modify data (like scrobble), bypass cache
+            with requests_cache.disabled():
+                 response = requests.post(API_URL, data=request_params)
         else: # Default to GET
             # Use request_params which now includes api_sig and format
+            # GET requests will use the installed cache automatically
             response = requests.get(API_URL, params=request_params)
+
+        # Check cache status (optional, for debugging)
+        # print(f"Cache used for {method}: {getattr(response, 'from_cache', False)}")
 
         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
@@ -80,7 +105,12 @@ def _make_api_request(method, http_method='GET', params=None, requires_signature
 
     except requests.exceptions.RequestException as e:
         # Handle network errors, timeouts, etc.
-        raise LastfmApiError(code=None, message=f"Network error during API request: {e}") from e
+        # Check if the request was from cache; if so, the cache file might be corrupted
+        is_from_cache = getattr(locals().get('response'), 'from_cache', False)
+        error_message = f"Network error during API request: {e}"
+        if is_from_cache:
+            error_message += " (Request was from cache, cache might be corrupted)"
+        raise LastfmApiError(code=None, message=error_message) from e
     except ValueError as e:
         # Handle JSON decoding errors
         raise LastfmApiError(code=None, message=f"Error decoding API response: {response.text}") from e
@@ -108,7 +138,9 @@ def get_session_key():
     }
     # Note: getMobileSession requires API signature
     try:
-        data = _make_api_request('auth.getMobileSession', http_method='POST', params=auth_params, requires_signature=True)
+        # Authentication should not be cached
+        with requests_cache.disabled():
+            data = _make_api_request('auth.getMobileSession', http_method='POST', params=auth_params, requires_signature=True)
         if data and 'session' in data and 'key' in data['session']:
             return data['session']['key']
         else:
@@ -119,13 +151,26 @@ def get_session_key():
         raise LastfmApiError(code=e.code, message=f"Authentication failed: {e.message}")
 
 
-def search_track(artist, track):
-    """Searches for a track on Last.fm. Returns a list of track results."""
+def search_track(artist=None, track=None):
+    """
+    Searches for a track on Last.fm. Returns a list of track result dictionaries, including image URL.
+    Either artist or track parameter can be provided alone for more dynamic searches.
+    """
     search_params = {
-        'artist': artist,
-        'track': track,
-        'limit': 10 # Limit results for GUI display
+        'limit': 15  # Increased limit for more results
     }
+    
+    # Add parameters only if they're provided
+    if artist and artist.strip():
+        search_params['artist'] = artist.strip()
+    
+    if track and track.strip():
+        search_params['track'] = track.strip()
+        
+    # At least one parameter should be provided
+    if not search_params.get('artist') and not search_params.get('track'):
+        return []
+    
     try:
         data = _make_api_request('track.search', params=search_params)
         if (data and 'results' in data and
@@ -135,212 +180,379 @@ def search_track(artist, track):
             tracks_data = data['results']['trackmatches']['track']
             # Ensure tracks_data is always a list
             if isinstance(tracks_data, dict):
-                return [tracks_data] # Wrap single track in a list
-            elif isinstance(tracks_data, list):
-                return tracks_data
-            else:
-                return [] # No tracks found
+                tracks_data = [tracks_data]  # Wrap single track in a list
+            elif not isinstance(tracks_data, list):
+                 tracks_data = [] # No tracks found or unexpected format
+
+            # Extract relevant info, including image
+            results = []
+            for t in tracks_data:
+                results.append({
+                    'name': t.get('name'),
+                    'artist': t.get('artist'),
+                    'url': t.get('url'),
+                    'listeners': t.get('listeners'),
+                    'image_url': _extract_image_url(t.get('image'))
+                })
+            return results
         else:
-            return [] # No results structure found
+            return []  # No results structure found
     except LastfmApiError as e:
-        print(f"Error during track search: {e}") # Log or handle differently in GUI
-        return [] # Return empty list on error for search
+        print(f"Error during track search: {e}")  # Log or handle differently in GUI
+        return []  # Return empty list on error for search
 
 
 def get_album_tracks(artist, album):
     """Fetches track list for a given album. Returns a list of track names."""
+    # Use get_album_info instead to get image and more details
+    album_info = get_album_info(artist, album)
+    if album_info and 'tracks' in album_info and 'track' in album_info['tracks']:
+        tracks_data = album_info['tracks']['track']
+        if isinstance(tracks_data, dict):
+            tracks_data = [tracks_data] # Wrap single track
+
+        track_list = [track['name'] for track in tracks_data if 'name' in track]
+        return track_list
+    else:
+        return None # Indicate album found but no tracks, or other non-error issue
+
+
+def get_track_info(artist, track):
+    """Gets detailed information about a specific track, including album title and image."""
+    track_params = {
+        'artist': artist,
+        'track': track,
+    }
+    try:
+        data = _make_api_request('track.getInfo', params=track_params)
+        if data and 'track' in data:
+            track_details = data['track']
+            album_info = track_details.get('album')
+            # Extract info safely
+            result = {
+                'name': track_details.get('name'),
+                'artist': track_details.get('artist', {}).get('name'), # Artist info is nested
+                'url': track_details.get('url'),
+                'duration': track_details.get('duration'), # Often 0 if unknown
+                'listeners': track_details.get('listeners'),
+                'playcount': track_details.get('playcount'),
+                'album_title': album_info.get('title') if album_info else None,
+                'album_artist': album_info.get('artist') if album_info else None, # Usually same as track artist
+                'image_url': _extract_image_url(album_info.get('image')) if album_info else _extract_image_url(track_details.get('image')), # Prefer album art
+                'tags': [tag.get('name') for tag in track_details.get('toptags', {}).get('tag', [])],
+                'wiki': track_details.get('wiki', {}).get('content') # Track wiki/bio
+            }
+            return result
+        else:
+            return None
+    except LastfmApiError as e:
+        print(f"Error getting track info: {e}")
+        return None
+
+
+def search_artist(artist_name):
+    """
+    Search for an artist on Last.fm.
+    Returns a list of artist dicts including name, image URLs, and listener stats.
+    """
+    search_params = {
+        'artist': artist_name,
+        'limit': 10
+    }
+    try:
+        data = _make_api_request('artist.search', params=search_params)
+        if (data and 'results' in data and
+            'artistmatches' in data['results'] and
+            'artist' in data['results']['artistmatches']):
+            
+            artists_data = data['results']['artistmatches']['artist']
+            if isinstance(artists_data, dict):
+                artists_data = [artists_data]  # Wrap single artist in a list
+            elif not isinstance(artists_data, list):
+                artists_data = []
+
+            results = []
+            for a in artists_data:
+                 results.append({
+                    'name': a.get('name'),
+                    'listeners': a.get('listeners'),
+                    'mbid': a.get('mbid'), # MusicBrainz ID
+                    'url': a.get('url'),
+                    'image_url': _extract_image_url(a.get('image'))
+                 })
+            return results
+        else:
+            return []
+    except LastfmApiError as e:
+        print(f"Error during artist search: {e}")
+        return []
+
+
+def get_artist_info(artist_name):
+    """
+    Get detailed information about an artist including bio, similar artists, tags, image etc.
+    """
+    artist_params = {
+        'artist': artist_name
+    }
+    try:
+        data = _make_api_request('artist.getInfo', params=artist_params)
+        if data and 'artist' in data:
+            artist_details = data['artist']
+            result = {
+                 'name': artist_details.get('name'),
+                 'mbid': artist_details.get('mbid'),
+                 'url': artist_details.get('url'),
+                 'image_url': _extract_image_url(artist_details.get('image')),
+                 'listeners': artist_details.get('stats', {}).get('listeners'),
+                 'playcount': artist_details.get('stats', {}).get('playcount'),
+                 'similar_artists': [sim_art.get('name') for sim_art in artist_details.get('similar', {}).get('artist', [])],
+                 'tags': [tag.get('name') for tag in artist_details.get('tags', {}).get('tag', [])],
+                 'bio_summary': artist_details.get('bio', {}).get('summary'),
+                 'bio_content': artist_details.get('bio', {}).get('content')
+            }
+            return result
+        else:
+            return None
+    except LastfmApiError as e:
+        print(f"Error getting artist info: {e}")
+        return None
+
+
+def get_artist_top_tracks(artist_name, limit=10):
+    """
+    Get the top tracks for an artist, including image URL (usually album art).
+    """
+    track_params = {
+        'artist': artist_name,
+        'limit': limit
+    }
+    try:
+        data = _make_api_request('artist.getTopTracks', params=track_params)
+        if data and 'toptracks' in data and 'track' in data['toptracks']:
+            tracks_data = data['toptracks']['track']
+            if isinstance(tracks_data, dict):
+                tracks_data = [tracks_data] # Wrap single track
+            elif not isinstance(tracks_data, list):
+                 tracks_data = []
+
+            results = []
+            for t in tracks_data:
+                 results.append({
+                     'name': t.get('name'),
+                     'playcount': t.get('playcount'),
+                     'listeners': t.get('listeners'),
+                     'mbid': t.get('mbid'),
+                     'url': t.get('url'),
+                     'artist': t.get('artist', {}).get('name'), # Artist info nested
+                     'image_url': _extract_image_url(t.get('image'))
+                 })
+            return results
+        else:
+            return []
+    except LastfmApiError as e:
+        print(f"Error getting top tracks: {e}")
+        return []
+
+
+def get_artist_albums(artist_name, limit=20):
+    """
+    Get the top albums for an artist, including image URL.
+    """
+    album_params = {
+        'artist': artist_name,
+        'limit': limit
+    }
+    try:
+        data = _make_api_request('artist.getTopAlbums', params=album_params)
+        if data and 'topalbums' in data and 'album' in data['topalbums']:
+            albums_data = data['topalbums']['album']
+            if isinstance(albums_data, dict):
+                albums_data = [albums_data] # Wrap single album
+            elif not isinstance(albums_data, list):
+                 albums_data = []
+
+            results = []
+            for a in albums_data:
+                 results.append({
+                    'name': a.get('name'),
+                    'playcount': a.get('playcount'),
+                    'mbid': a.get('mbid'),
+                    'url': a.get('url'),
+                    'artist': a.get('artist', {}).get('name'), # Artist info nested
+                    'image_url': _extract_image_url(a.get('image'))
+                 })
+            return results
+        else:
+            return []
+    except LastfmApiError as e:
+        print(f"Error getting artist albums: {e}")
+        return []
+
+
+def get_album_info(artist, album):
+    """
+    Get detailed information about an album including tracks, release date, cover art, tags, wiki.
+    """
     album_params = {
         'artist': artist,
-        'album': album,
+        'album': album
     }
     try:
         data = _make_api_request('album.getInfo', params=album_params)
-        if (data and 'album' in data and
-            'tracks' in data['album'] and
-            'track' in data['album']['tracks']):
+        if data and 'album' in data:
+            album_details = data['album']
+            result = {
+                'name': album_details.get('name'),
+                'artist': album_details.get('artist'),
+                'mbid': album_details.get('mbid'),
+                'url': album_details.get('url'),
+                'image_url': _extract_image_url(album_details.get('image')),
+                'listeners': album_details.get('listeners'),
+                'playcount': album_details.get('playcount'),
+                'release_date': album_details.get('wiki', {}).get('published'), # Often in wiki
+                'tags': [tag.get('name') for tag in album_details.get('tags', {}).get('tag', [])],
+                'wiki_summary': album_details.get('wiki', {}).get('summary'),
+                'wiki_content': album_details.get('wiki', {}).get('content'),
+                'tracks': [{ # Extract basic track info here too
+                    'name': track.get('name'),
+                    'duration': track.get('duration'), # Sometimes available
+                    'url': track.get('url'),
+                    '@attr': track.get('@attr', {}) # Contains rank
+                 } for track in album_details.get('tracks', {}).get('track', [])]
 
-            tracks_data = data['album']['tracks']['track']
-            if isinstance(tracks_data, dict):
-                tracks_data = [tracks_data] # Wrap single track
+            }
+            # Ensure tracks is always a list, even if API returns single item not in list
+            if 'tracks' in album_details and 'track' in album_details['tracks'] and isinstance(album_details['tracks']['track'], dict):
+                 result['tracks'] = [result['tracks'][0]] # Wrap the single track dict
 
-            track_list = [track['name'] for track in tracks_data if 'name' in track]
-            return track_list
+
+            return result
         else:
-            # Album might exist but have no tracks listed, or album not found
-            # The API error for "not found" should be caught by LastfmApiError
-            return None # Indicate album found but no tracks, or other non-error issue
+            return None
     except LastfmApiError as e:
         # Handle specific errors like "Album not found" (error code 6)
         if e.code == 6:
-            print(f"Album '{album}' by '{artist}' not found.")
+            print(f"Album '{album}' by '{artist}' not found.") # Keep console message for now
         else:
-            print(f"Error fetching album info: {e}")
-        return None # Return None on error
+            print(f"Error getting album info: {e}")
+        return None # Return None on error or not found
 
-
-def scrobble_track(artist, track, timestamp, session_key, album=None):
-    """Scrobbles a single track to Last.fm. Returns True on success, False on failure."""
-    if not session_key:
-        raise ValueError("Session key is required to scrobble.")
-
-    scrobble_params = {
-        'artist[0]': artist,
-        'track[0]': track,
-        'timestamp[0]': timestamp,
-    }
-    if album:
-        scrobble_params['album[0]'] = album
-
-    try:
-        data = _make_api_request('track.scrobble', http_method='POST', params=scrobble_params, requires_signature=True, requires_session=True, session_key=session_key)
-
-        # Check response structure for scrobbles array and acceptance attribute
-        if data and 'scrobbles' in data:
-            scrobble_info = data['scrobbles']
-            # Handle cases where response might be dict ('scrobble') or list ('@attr')
-            if isinstance(scrobble_info, dict) and 'scrobble' in scrobble_info:
-                 # Check inner structure if needed, assume success for now
-                 return True
-            elif isinstance(scrobble_info, dict) and '@attr' in scrobble_info and scrobble_info['@attr'].get('accepted', 0) == 1:
-                 return True
-            elif isinstance(scrobble_info, dict) and '@attr' in scrobble_info and scrobble_info['@attr'].get('ignored', 0) == 1:
-                 ignored_code = scrobble_info['scrobble']['ignoredMessage'].get('code', 'N/A')
-                 ignored_msg = scrobble_info['scrobble']['ignoredMessage'].get('#text', 'Ignored')
-                 print(f"Scrobble ignored ({ignored_code}): {ignored_msg} for track '{track}'")
-                 return False # Treat ignored as failure for our purpose
-
-        # If structure isn't as expected or not accepted/ignored
-        print(f"Failed to scrobble '{track}' by '{artist}'. Unexpected Response: {data}")
-        return False
-
-    except LastfmApiError as e:
-        print(f"Error during scrobble request: {e}")
-        return False
 
 # --- Batch Scrobbling Helper ---
-
-def scrobble_multiple_tracks(tracks_info, session_key, base_timestamp=None, delay_seconds=0.2, progress_callback=None):
+def scrobble_multiple_tracks(tracks_info, session_key, base_timestamp=None, delay_seconds=0.1, progress_callback=None):
     """
-    Scrobbles a list of tracks with specified counts and timestamps.
+    Scrobbles a list of tracks using batch requests (up to 50 per request).
 
     Args:
         tracks_info (list): A list of dictionaries, each containing:
                             {'artist': str, 'track': str, 'album': str|None, 'count': int}
         session_key (str): The authenticated session key.
-        base_timestamp (int, optional): The timestamp for the *most recent* scrobble.
-                                        Older scrobbles will be calculated relative to this.
+        base_timestamp (int, optional): Timestamp for the *most recent* scrobble.
                                         Defaults to current time.
-        delay_seconds (float): Delay between individual scrobble API calls.
-        progress_callback (callable, optional): A function to call for progress updates.
-                                                It receives (current_count, total_count, message).
+        delay_seconds (float): Delay between batch API calls.
+        progress_callback (callable, optional): Receives (current_count, total_count, message).
 
     Returns:
         tuple: (success_count, failure_count)
     """
+    if not session_key:
+        raise ValueError("Session key is required to scrobble.")
     if base_timestamp is None:
         base_timestamp = int(time.time())
 
-    total_scrobbles_to_send = sum(info.get('count', 0) for info in tracks_info)
-    if total_scrobbles_to_send == 0:
-        return 0, 0
+    all_scrobbles = []
+    total_scrobbles_to_send = 0
+    timestamp_offset = 0 # Increments for each individual scrobble generated
 
-    print(f"Preparing to send {total_scrobbles_to_send} scrobbles...")
-
-    scrobbles_sent_total = 0
-    failed_scrobbles_total = 0
-    timestamp_offset = 0 # Increments for each scrobble sent
-
+    # 1. Generate flat list of all individual scrobbles with timestamps
     for track_info in tracks_info:
-        artist = track_info['artist']
-        track = track_info['track']
-        album = track_info.get('album') # Optional
         count = track_info.get('count', 0)
-
         if count <= 0:
             continue
-
-        print(f"\nScrobbling '{track}' by '{artist}' ({count} times)")
-        scrobbles_sent_this_track = 0
-
-        for i in range(count):
+        total_scrobbles_to_send += count
+        for _ in range(count):
             # Calculate timestamp for this specific scrobble (going backwards in time)
-            timestamp_to_use = base_timestamp - (timestamp_offset * 60) # 1 minute apart seems reasonable
+            # Spread timestamps slightly (e.g., 60 seconds apart)
+            timestamp_to_use = base_timestamp - timestamp_offset * 60
             timestamp_offset += 1
+            all_scrobbles.append({
+                'artist': track_info['artist'],
+                'track': track_info['track'],
+                'album': track_info.get('album'),
+                'timestamp': timestamp_to_use
+            })
 
-            success = scrobble_track(artist, track, timestamp_to_use, session_key, album=album)
+    if not all_scrobbles:
+        print("No tracks to scrobble.")
+        return 0, 0
 
-            if success:
-                scrobbles_sent_total += 1
-                scrobbles_sent_this_track += 1
-            else:
-                failed_scrobbles_total += 1
-                # Log failure, maybe add retry later
-                print(f"  Failed attempt {i+1}/{count} for '{track}'")
-                time.sleep(1) # Longer delay after failure
+    print(f"Preparing to send {total_scrobbles_to_send} scrobbles in batches...")
+    scrobbles_sent_total = 0
+    failed_scrobbles_total = 0
+    processed_count = 0
+    batch_size = 50
 
-            # Progress update
-            progress_message = f"Track: {scrobbles_sent_this_track}/{count} | Total: {scrobbles_sent_total}/{total_scrobbles_to_send}"
-            print(f"  {progress_message}", end='\r')
-            if progress_callback:
-                try:
-                    progress_callback(scrobbles_sent_total, total_scrobbles_to_send, progress_message)
-                except Exception as cb_err:
-                    print(f"\nError in progress callback: {cb_err}") # Don't let callback crash scrobbling
+    # 2. Group into chunks and send batch requests
+    for i in range(0, len(all_scrobbles), batch_size):
+        batch = all_scrobbles[i:i + batch_size]
+        batch_params = {}
+        print(f"Sending batch {i // batch_size + 1}/{(len(all_scrobbles) + batch_size - 1) // batch_size} ({len(batch)} tracks)")
 
-            # Delay between all requests
-            time.sleep(delay_seconds)
+        # Construct parameters for the batch
+        for idx, scrobble in enumerate(batch):
+            batch_params[f'artist[{idx}]'] = scrobble['artist']
+            batch_params[f'track[{idx}]'] = scrobble['track']
+            batch_params[f'timestamp[{idx}]'] = scrobble['timestamp']
+            if scrobble['album']:
+                batch_params[f'album[{idx}]'] = scrobble['album']
 
-        print() # Newline after finishing a track's scrobbles
+        try:
+            # Make the batch API request
+            data = _make_api_request('track.scrobble', http_method='POST', params=batch_params, requires_signature=True, requires_session=True, session_key=session_key)
 
-    print(f"\nFinished. Sent: {scrobbles_sent_total}, Failed: {failed_scrobbles_total}")
+            # 3. Parse Batch Response
+            accepted_count = 0
+            ignored_count = 0
+            if data and 'scrobbles' in data:
+                scrobbles_attr = data['scrobbles'].get('@attr', {})
+                accepted_count = int(scrobbles_attr.get('accepted', 0))
+                ignored_count = int(scrobbles_attr.get('ignored', 0))
+                # Note: The detailed ignored messages per track aren't easily accessible here without complex parsing
+                if ignored_count > 0:
+                     print(f"  Batch {i // batch_size + 1}: {ignored_count} scrobbles ignored (check Last.fm profile for details).")
+
+            scrobbles_sent_total += accepted_count
+            failed_scrobbles_total += ignored_count
+            processed_count += len(batch) # Update progress based on tracks processed in the batch
+
+            print(f"  Batch {i // batch_size + 1}: Accepted: {accepted_count}, Ignored: {ignored_count}")
+
+        except LastfmApiError as e:
+            print(f"ERROR during scrobble batch {i // batch_size + 1}: {e}")
+            failed_scrobbles_total += len(batch) # Assume all in batch failed on API error
+            processed_count += len(batch)
+            # Add a longer delay after a batch error
+            time.sleep(2)
+        except Exception as e:
+            print(f"UNEXPECTED ERROR during scrobble batch {i // batch_size + 1}: {e}")
+            failed_scrobbles_total += len(batch)
+            processed_count += len(batch)
+            time.sleep(2)
+
+        # 4. Update Progress Callback
+        progress_message = f"Batch {i // batch_size + 1} done | Processed: {processed_count}/{total_scrobbles_to_send}"
+        if progress_callback:
+            try:
+                progress_callback(processed_count, total_scrobbles_to_send, progress_message)
+            except InterruptedError: # Catch interruption from callback
+                raise # Re-raise to stop the loop
+            except Exception as cb_err:
+                print(f"\nError in progress callback: {cb_err}")
+
+        # Delay between batch requests
+        if i + batch_size < len(all_scrobbles):
+             time.sleep(delay_seconds)
+
+    print(f"\nFinished. Accepted: {scrobbles_sent_total}, Failed/Ignored: {failed_scrobbles_total}")
     return scrobbles_sent_total, failed_scrobbles_total
-
-
-# Example usage (for testing the module directly, remove in final GUI app)
-# if __name__ == "__main__":
-#     try:
-#         print("Attempting authentication...")
-#         sk = get_session_key()
-#         print(f"Session Key obtained: {sk[:5]}...") # Don't print full key normally
-
-#         # Test Search
-#         print("\nTesting track search...")
-#         results = search_track("Pink Floyd", "Comfortably Numb")
-#         if results:
-#             print(f"Found {len(results)} results for 'Comfortably Numb':")
-#             for r in results[:3]: # Print top 3
-#                 print(f" - {r.get('name')} by {r.get('artist')}")
-#         else:
-#             print("Search returned no results.")
-
-#         # Test Album Info
-#         print("\nTesting album info...")
-#         tracks = get_album_tracks("Pink Floyd", "The Wall")
-#         if tracks:
-#             print(f"Found {len(tracks)} tracks on 'The Wall':")
-#             print(f"  First few: {tracks[:5]}")
-#         else:
-#             print("Could not get tracks for 'The Wall'.")
-
-#         # Test Scrobble (Use with caution!)
-#         # print("\nTesting scrobble...")
-#         # current_ts = int(time.time())
-#         # success = scrobble_track("Test Artist", "Test Track", current_ts - 600, sk, album="Test Album")
-#         # print(f"Scrobble success: {success}")
-
-#         # Test Batch Scrobble (Use with extreme caution!)
-#         # print("\nTesting batch scrobble...")
-#         # tracks_to_batch = [
-#         #     {'artist': 'Test Batch Artist', 'track': 'Batch Track 1', 'album': 'Batch Album', 'count': 2},
-#         #     {'artist': 'Test Batch Artist', 'track': 'Batch Track 2', 'album': 'Batch Album', 'count': 1},
-#         # ]
-#         # sent, failed = scrobble_multiple_tracks(tracks_to_batch, sk)
-#         # print(f"Batch result: Sent={sent}, Failed={failed}")
-
-
-#     except ValueError as e:
-#         print(f"Configuration Error: {e}")
-#     except LastfmApiError as e:
-#         print(f"API Error: {e}")
-#     except Exception as e:
-#         print(f"An unexpected error occurred: {e}")

@@ -1,3 +1,6 @@
 requests
 python-dotenv
 PyQt6
+Pillow
+requests-cache
+PyQt6-WebEngine
