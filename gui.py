@@ -1109,6 +1109,35 @@ class LastfmScrobblerApp(QWidget):
 
         # REMOVED: self.api_worker = None # Let start_scrobble_task manage the worker reference
 
+    def _scrobble_with_basic_info(self, track_data, count):
+        """Fallback to scrobble using basic track information when detailed fetch fails."""
+        if not track_data:
+            self.set_controls_enabled(True)
+            self.status_label.setText("Status: Scrobble failed - track data unavailable")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            QMessageBox.warning(self, "Error", "Could not scrobble the track - track data unavailable.")
+            return
+
+        artist = track_data.get('artist', '')
+        track_name = track_data.get('name', '')
+        
+        if not artist or not track_name:
+            self.set_controls_enabled(True)
+            self.status_label.setText("Status: Scrobble failed - track details incomplete")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            QMessageBox.warning(self, "Error", "Could not scrobble the track - details incomplete.")
+            return
+            
+        # Use the basic info without album (explicitly set to empty string rather than None)
+        tracks_to_scrobble = [{
+            'artist': artist,
+            'track': track_name,
+            'album': "",  # Empty string instead of None for better compatibility
+            'count': count
+        }]
+        
+        self.start_scrobble_task(tracks_to_scrobble=tracks_to_scrobble)
+
     # --- Album Fetch Logic ---
     def start_fetch_album_info_task(self):
         print("DEBUG: start_fetch_album_info_task called") # <<< Added Debug Print
