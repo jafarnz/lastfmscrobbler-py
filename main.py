@@ -5,13 +5,17 @@ import time
 import hashlib
 import requests
 from dotenv import load_dotenv
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union, Any
 
 load_dotenv() # Load environment variables from .env file
 
-API_KEY = os.getenv('LASTFM_API_KEY')
-API_SECRET = os.getenv('LASTFM_API_SECRET')
-USERNAME = os.getenv('LASTFM_USERNAME')
-PASSWORD = os.getenv('LASTFM_PASSWORD')
+# Default values that will be updated by the login dialog
+API_KEY = ""
+API_SECRET = ""
+USERNAME = ""
+PASSWORD = ""
 
 API_URL = 'http://ws.audioscrobbler.com/2.0/'
 
@@ -97,27 +101,74 @@ class LastfmApiError(Exception):
 
 # --- Core API Functions ---
 
-def get_session_key():
-    """Authenticates with Last.fm and retrieves a session key."""
-    if not all([API_KEY, API_SECRET, USERNAME, PASSWORD]):
-        raise ValueError("API Key, Secret, Username, and Password must be set in .env")
-
-    auth_params = {
+def get_session_key_from_credentials():
+    """Get session key directly using the stored credentials"""
+    if not API_KEY or not API_SECRET or not USERNAME or not PASSWORD:
+        raise ValueError("API key, API secret, username, and password are required")
+        
+    # Create signature for auth.getMobileSession
+    sig = hashlib.md5(
+        f'api_key{API_KEY}methodauth.getMobileSessionpassword{PASSWORD}username{USERNAME}{API_SECRET}'.encode()
+    ).hexdigest()
+    
+    params = {
+        'method': 'auth.getMobileSession',
+        'api_key': API_KEY,
         'username': USERNAME,
         'password': PASSWORD,
+        'api_sig': sig,
+        'format': 'json'
     }
-    # Note: getMobileSession requires API signature
-    try:
-        data = _make_api_request('auth.getMobileSession', http_method='POST', params=auth_params, requires_signature=True)
-        if data and 'session' in data and 'key' in data['session']:
-            return data['session']['key']
-        else:
-            # This path might be less likely now due to error checking in _make_api_request
-            raise LastfmApiError(code=None, message=f"Authentication failed. Response: {data}")
-    except LastfmApiError as e:
-        # Re-raise specific auth errors for clarity
-        raise LastfmApiError(code=e.code, message=f"Authentication failed: {e.message}")
+    
+    response = requests.post('https://ws.audioscrobbler.com/2.0/', data=params)
+    data = response.json()
+    
+    if 'error' in data:
+        raise Exception(f"Failed to get session key: {data.get('message', 'Unknown error')}")
+    
+    if 'session' not in data:
+        raise Exception(f"Failed to get session key: Response missing session data")
+    
+    return data['session']['key']
 
+def get_auth_token() -> str:
+    """Get authentication token from Last.fm"""
+    params = {
+        'method': 'auth.getToken',
+        'api_key': API_KEY,
+        'format': 'json'
+    }
+    
+    response = requests.get('https://ws.audioscrobbler.com/2.0/', params=params)
+    data = response.json()
+    
+    if 'token' not in data:
+        raise Exception(f"Failed to get auth token: {data.get('message', 'Unknown error')}")
+    
+    return data['token']
+
+def get_session_key(token: str) -> str:
+    """Get session key using the auth token"""
+    # Create the signature
+    sig = hashlib.md5(
+        f'api_key{API_KEY}methodauth.getSessiontoken{token}{API_SECRET}'.encode()
+    ).hexdigest()
+    
+    params = {
+        'method': 'auth.getSession',
+        'api_key': API_KEY,
+        'token': token,
+        'api_sig': sig,
+        'format': 'json'
+    }
+    
+    response = requests.get('https://ws.audioscrobbler.com/2.0/', params=params)
+    data = response.json()
+    
+    if 'session' not in data:
+        raise Exception(f"Failed to get session key: {data.get('message', 'Unknown error')}")
+    
+    return data['session']['key']
 
 def search_track(artist=None, track=None):
     """

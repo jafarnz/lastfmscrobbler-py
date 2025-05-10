@@ -1,16 +1,19 @@
 import sys
 import time
-import io # Added
-from functools import partial # Added for connecting signals with arguments
+import io
+import json
+import os
+from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QSpinBox, QTabWidget, QListWidget, QListWidgetItem,
     QMessageBox, QProgressDialog, QGroupBox, QFormLayout, QRadioButton,
-    QSpacerItem, QSizePolicy, QScrollArea, QFrame, QTextEdit # Added QTextEdit for bio
+    QSpacerItem, QSizePolicy, QScrollArea, QFrame, QTextEdit, QDialog, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QBuffer, QIODevice, pyqtSlot, QUrl # Added QUrl
-from PyQt6.QtGui import QPixmap, QPalette, QColor, QCursor, QPainter, QFont # Added QPainter, QFont
-from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply # Added networking modules
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QBuffer, QIODevice, pyqtSlot, QUrl
+from PyQt6.QtGui import QPixmap, QPalette, QColor, QCursor, QPainter, QFont
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from PyQt6.QtGui import QDesktopServices
 
 # Import API functions and exception from main.py
 from main import (
@@ -18,6 +21,7 @@ from main import (
     get_track_info, get_album_info, # Added get_album_info
     search_artist, get_artist_info, get_artist_top_tracks, get_artist_albums, # Added artist functions
     LastfmApiError, API_KEY, API_SECRET, USERNAME, PASSWORD,
+    get_auth_token, get_session_key_from_credentials,
 )
 
 # --- Constants ---
@@ -84,27 +88,169 @@ class ApiWorker(QThread):
         super().requestInterruption() # Call base class method too
 
 
+# --- Login Dialog ---
+class LoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Last.fm Login")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(self)
+        
+        # API Key and Secret fields
+        api_group = QGroupBox("Last.fm API Credentials")
+        api_form = QFormLayout()
+        
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("Enter your Last.fm API Key")
+        self.api_secret_input = QLineEdit()
+        self.api_secret_input.setPlaceholderText("Enter your Last.fm API Secret")
+        
+        api_form.addRow("API Key:", self.api_key_input)
+        api_form.addRow("API Secret:", self.api_secret_input)
+        api_group.setLayout(api_form)
+        layout.addWidget(api_group)
+        
+        # Username and Password fields
+        auth_group = QGroupBox("Last.fm Account")
+        auth_form = QFormLayout()
+        
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText("Enter your Last.fm username")
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Enter your Last.fm password")
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        
+        auth_form.addRow("Username:", self.username_input)
+        auth_form.addRow("Password:", self.password_input)
+        auth_group.setLayout(auth_form)
+        layout.addWidget(auth_group)
+        
+        # Remember Me checkbox
+        self.remember_checkbox = QCheckBox("Remember credentials")
+        self.remember_checkbox.setChecked(True)  # Default to checked
+        layout.addWidget(self.remember_checkbox)
+        
+        # Help text
+        help_text = QLabel(
+            "To get your API credentials:\n"
+            "1. Go to https://www.last.fm/api/account/create\n"
+            "2. Create a new API account\n"
+            "3. Copy the API Key and Secret\n"
+            "4. Enter your Last.fm username and password"
+        )
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet("color: #AAAAAA; font-size: 9pt;")
+        layout.addWidget(help_text)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        self.login_button = QPushButton("Login")
+        self.login_button.clicked.connect(self.accept)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        
+        button_layout.addWidget(self.login_button)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
+        
+        # Load saved credentials if they exist
+        self.load_saved_credentials()
+    
+    def load_saved_credentials(self):
+        """Load saved credentials from the config file."""
+        try:
+            if os.path.exists('config.json'):
+                with open('config.json', 'r') as f:
+                    config = json.load(f)
+                    if config.get('remember_credentials', False):
+                        self.api_key_input.setText(config.get('api_key', ''))
+                        self.api_secret_input.setText(config.get('api_secret', ''))
+                        self.username_input.setText(config.get('username', ''))
+                        self.password_input.setText(config.get('password', ''))
+                        self.remember_checkbox.setChecked(True)
+        except Exception as e:
+            print(f"Error loading saved credentials: {e}")
+    
+    def save_credentials(self):
+        """Save credentials to the config file if remember is checked."""
+        if self.remember_checkbox.isChecked():
+            config = {
+                'api_key': self.api_key_input.text().strip(),
+                'api_secret': self.api_secret_input.text().strip(),
+                'username': self.username_input.text().strip(),
+                'password': self.password_input.text().strip(),
+                'remember_credentials': True
+            }
+            try:
+                with open('config.json', 'w') as f:
+                    json.dump(config, f)
+            except Exception as e:
+                print(f"Error saving credentials: {e}")
+        else:
+            # If remember is not checked, remove the config file if it exists
+            try:
+                if os.path.exists('config.json'):
+                    os.remove('config.json')
+            except Exception as e:
+                print(f"Error removing config file: {e}")
+    
+    def get_credentials(self):
+        return {
+            'api_key': self.api_key_input.text().strip(),
+            'api_secret': self.api_secret_input.text().strip(),
+            'username': self.username_input.text().strip(),
+            'password': self.password_input.text().strip()
+        }
+
 # --- Main Application Window ---
 class LastfmScrobblerApp(QWidget):
     def __init__(self):
         super().__init__()
         self.session_key = None
-        self.api_worker = None # To hold the worker thread instance
-        self.progress_dialog = None # To show progress during long tasks
-        self.current_album_artist = None # Store artist for album scrobble
-        self.current_album_name = None # Store album name for album scrobble
-        self.network_manager = QNetworkAccessManager(self) # Initialize Network Manager
+        self.api_worker = None
+        self.progress_dialog = None
+        self.current_album_artist = None
+        self.current_album_name = None
+        self.network_manager = QNetworkAccessManager(self)
         self.network_manager.finished.connect(self.handle_image_reply)
-        self.image_cache = {} # Simple cache for loaded QPixmaps
-        self.image_widget_map = {} # Map URL to target QLabel to display the image
-        self.selected_search_item_widget = None # Track selected search item
-        self.pending_replies = set() # Set to manage pending image downloads
-
+        self.image_cache = {}
+        self.image_widget_map = {}
+        self.selected_search_item_widget = None
+        self.pending_replies = set()
+        
+        # Initialize UI first
         self.init_ui()
-        self.authenticate() # Try to authenticate on startup
+        
+        # Then show login dialog
+        self.show_login_dialog()
+    
+    def show_login_dialog(self):
+        dialog = LoginDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            credentials = dialog.get_credentials()
+            if not all(credentials.values()):
+                QMessageBox.critical(self, "Error", "Please fill in all fields.")
+                sys.exit(1)
+            
+            # Save credentials if remember is checked
+            dialog.save_credentials()
+            
+            # Update the API credentials in main.py
+            import main
+            main.API_KEY = credentials['api_key']
+            main.API_SECRET = credentials['api_secret']
+            main.USERNAME = credentials['username']
+            main.PASSWORD = credentials['password']
+            
+            # Try to authenticate
+            self.authenticate()
+        else:
+            sys.exit(0)  # Exit if login was cancelled
 
     def init_ui(self):
-        self.setWindowTitle('Last.fm Scrobbler Deluxe') # New Title
+        self.setWindowTitle('✧･ﾟ: *✧･ﾟ cunty scrobbler ･ﾟ✧*:･ﾟ✧') # Fierce new title
         self.setGeometry(100, 100, 800, 650) # Even larger size
 
         # Initialize search timer for dynamic searches
@@ -135,7 +281,7 @@ class LastfmScrobblerApp(QWidget):
         self.main_layout.addWidget(self.auth_button)
 
         self.status_label.setText("Status: Not Authenticated") # Set initial status after UI init
-        self.status_label.setStyleSheet("color: #FFA500; background-color: #404040; padding: 4px; border-radius: 3px;") # Orange-ish
+        self.status_label.setStyleSheet("color: #ff4d94; background-color: #fff0f5; padding: 6px; border-radius: 8px; border: 1px solid #ff85a2;") # Pink theme
 
     def _setup_scrobble_tab(self):
         # -- Scrobble Tab --
@@ -414,19 +560,20 @@ class LastfmScrobblerApp(QWidget):
         label.setPixmap(scaled_pixmap)
 
     def get_placeholder_pixmap(self, size, text=None):
-        """Creates a gray placeholder pixmap with optional text."""
+        """Creates a stylish placeholder pixmap with optional text."""
         pixmap = QPixmap(size)
         if pixmap.isNull(): # Handle case where size might be invalid initially
              pixmap = QPixmap(QSize(64, 64)) # Default fallback size
-        pixmap.fill(QColor('#444444')) # Slightly darker placeholder
+        pixmap.fill(QColor('#ffb6d9')) # Cute pink background
 
         if text:
             painter = QPainter(pixmap)
-            painter.setPen(QColor('#AAAAAA'))
+            painter.setPen(QColor('#ffffff')) # White text
             # Adjust font size based on pixmap size
             font_size = max(8, min(size.width() // len(text) if len(text) > 0 else 10, size.height() // 3))
             font = QFont()
             font.setPointSize(font_size)
+            font.setBold(True) # Make text bold
             painter.setFont(font)
             # Draw text centered
             text_rect = pixmap.rect()
@@ -440,8 +587,9 @@ class LastfmScrobblerApp(QWidget):
         self.status_label.setText("Status: Authenticating...")
         self.status_label.setStyleSheet("color: blue; font-weight: bold;")
         self.set_controls_enabled(False) # Disable controls during auth
-        # Run auth in worker thread
-        self.api_worker = ApiWorker(get_session_key) # Use imported function
+        
+        # Use the direct credential-based authentication
+        self.api_worker = ApiWorker(get_session_key_from_credentials)
         self.api_worker.finished.connect(self.auth_finished)
         self.api_worker.error.connect(self.auth_error)
         self.api_worker.start()
@@ -450,7 +598,7 @@ class LastfmScrobblerApp(QWidget):
         if session_key:
             self.session_key = session_key
             self.status_label.setText("Status: Authenticated Successfully")
-            self.status_label.setStyleSheet("color: #50C878; background-color: #333; padding: 4px; border-radius: 3px;") # Greenish
+            self.status_label.setStyleSheet("color: #ff4d94; background-color: #fff0f5; padding: 6px; border-radius: 8px; border: 1px solid #ff85a2;")
             self.set_controls_enabled(True)
             self.auth_button.setText("Authenticated")
             self.auth_button.setEnabled(False)
@@ -460,7 +608,7 @@ class LastfmScrobblerApp(QWidget):
             # ------------------------------------------ #
         else:
             self.status_label.setText("Status: Authentication Failed (Unknown Reason)")
-            self.status_label.setStyleSheet("color: #FF6347; background-color: #400; padding: 4px; border-radius: 3px;") # Reddish
+            self.status_label.setStyleSheet("color: #cc0066; background-color: #fff0f5; padding: 6px; border-radius: 8px; border: 1px solid #ff4d94;")
             self.set_controls_enabled(True) # Keep controls enabled on fail, but auth button changes
             self.auth_button.setText("Re-authenticate")
             self.auth_button.setEnabled(True)
@@ -470,7 +618,7 @@ class LastfmScrobblerApp(QWidget):
     def auth_error(self, error_message):
         self.session_key = None
         self.status_label.setText("Status: Authentication Failed!")
-        self.status_label.setStyleSheet("color: #FF6347; background-color: #400; padding: 4px; border-radius: 3px;") # Reddish
+        self.status_label.setStyleSheet("color: #cc0066; background-color: #fff0f5; padding: 6px; border-radius: 8px; border: 1px solid #ff4d94;")
         self.set_controls_enabled(True) # Keep controls enabled on fail
         self.auth_button.setText("Re-authenticate")
         self.auth_button.setEnabled(True)
@@ -1681,285 +1829,282 @@ class LastfmScrobblerApp(QWidget):
 
 # --- Application Entry Point ---
 if __name__ == '__main__':
-    # Use imported variables for credential check
-    if not all([API_KEY, API_SECRET, USERNAME, PASSWORD]):
-        # Use a simple console message or a basic Tkinter/PyQt message box if preferred
-        print("CRITICAL ERROR: Last.fm API credentials (API_KEY, API_SECRET, USERNAME, PASSWORD) not found in .env file or main.py.")
-        print("Please create a .env file in the same directory with your credentials.")
-        # Optionally show a GUI message box here if QApplication is already running
-        # For simplicity, exiting here.
-        sys.exit(1) # Exit if credentials aren't set
-
     app = QApplication(sys.argv)
-    # Set Fusion style for a modern look
     app.setStyle('Fusion')
-
-    # --- Enhanced Modern Stylesheet --- #
+    
+    # Set the stylesheet - Kawaii but Fierce Theme
     app.setStyleSheet("""
-        /* Global Settings */
-        QWidget {
-            font-family: "Segoe UI", Frutiger, "Frutiger Linotype", "Dejavu Sans", "Helvetica Neue", Arial, sans-serif;
-            font-size: 10pt;
-            color: #E8E8E8; /* Lighter base text */
-            background-color: #1E1E1E; /* Darker background */
-        }
+    /* Global Settings */
+    QWidget {
+        font-family: "Helvetica Neue", Arial, sans-serif;
+        font-size: 10pt;
+        color: #212121; /* Rich dark text */
+        background-color: #fff0f5; /* Light pink background */
+    }
 
-        /* Group Boxes */
-        QGroupBox {
-            background-color: #2A2A2A; /* Slightly lighter group background */
-            border: 1px solid #3C3C3C;
-            border-radius: 6px;
-            margin-top: 20px; /* Increased margin for title spacing */
-            padding-top: 10px; /* Padding inside the box, below title */
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            padding: 5px 15px; /* More padding for title */
-            margin-left: 10px;
-            border-radius: 4px;
-            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                              stop:0 #3A3A3A, stop:1 #303030); /* Subtle gradient */
-            color: #CCCCCC;
-            font-weight: bold;
-        }
+    /* Group Boxes */
+    QGroupBox {
+        background-color: #ffe6ee; /* Soft pink */
+        border: 2px solid #ff85a2; /* Hot pink border */
+        border-radius: 8px;
+        margin-top: 20px;
+        padding-top: 10px;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        padding: 5px 15px;
+        margin-left: 10px;
+        border-radius: 6px;
+        background-color: #ff85a2; /* Hot pink */
+        color: #ffffff;
+        font-weight: bold;
+        letter-spacing: 1px;
+    }
 
-        /* Labels */
-        QLabel {
-            background-color: transparent;
-            color: #CFCFCF; /* Standard label color */
-            padding: 2px;
-        }
-        QLabel#status_label { /* Specific styling for status label */
-            font-weight: bold;
-            padding: 5px;
-            border-radius: 4px;
-            /* Background/color set dynamically */
-        }
+    /* Labels */
+    QLabel {
+        background-color: transparent;
+        color: #212121; /* Rich dark text */
+        padding: 2px;
+    }
+    QLabel#status_label {
+        font-weight: bold;
+        padding: 6px;
+        border-radius: 8px;
+        border: 1px solid #ff85a2;
+        letter-spacing: 0.5px;
+    }
 
-        /* LineEdits and SpinBoxes */
-        QLineEdit, QSpinBox {
-            background-color: #2F2F2F;
-            border: 1px solid #4A4A4A;
-            border-radius: 4px;
-            padding: 5px 8px;
-            color: #F0F0F0;
-            selection-background-color: #0078D7; /* Selection color */
-            selection-color: #FFFFFF;
-        }
-        QLineEdit:focus, QSpinBox:focus {
-            border: 1px solid #0078D7; /* Brighter focus border */
-            background-color: #333333;
-        }
-        QLineEdit::placeholderText {
-            color: #777777;
-        }
+    /* LineEdits and SpinBoxes */
+    QLineEdit, QSpinBox {
+        background-color: #ffffff;
+        border: 2px solid #ff85a2; /* Hot pink border */
+        border-radius: 6px;
+        padding: 6px 8px;
+        color: #212121;
+        selection-background-color: #ff85a2;
+        selection-color: #ffffff;
+    }
+    QLineEdit:focus, QSpinBox:focus {
+        border: 2px solid #ff4d94; /* Deeper pink for focus */
+        background-color: #fffafa; /* Snow white */
+    }
+    QLineEdit::placeholderText {
+        color: #b5a3b0; /* Muted mauve */
+    }
 
-        /* Buttons */
-        QPushButton {
-            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                              stop:0 #4D4D4D, stop:1 #424242); /* Button gradient */
-            color: #FFFFFF;
-            border: 1px solid #5A5A5A;
-            border-radius: 4px;
-            padding: 7px 15px;
-            min-width: 90px;
-            font-weight: bold;
-        }
-        QPushButton:hover {
-            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                              stop:0 #5D5D5D, stop:1 #525252);
-            border: 1px solid #6A6A6A;
-        }
-        QPushButton:pressed {
-            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                              stop:0 #404040, stop:1 #383838);
-            border: 1px solid #4A4A4A;
-            padding-top: 8px; /* Pressed effect */
-            padding-bottom: 6px;
-        }
-        QPushButton:disabled {
-            background-color: #353535;
-            color: #777777;
-            border: 1px solid #444444;
-        }
+    /* Buttons */
+    QPushButton {
+        background-color: #ff85a2; /* Hot pink */
+        color: #ffffff;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 16px;
+        min-width: 100px;
+        font-weight: bold;
+        letter-spacing: 1px;
+    }
+    QPushButton:hover {
+        background-color: #ff4d94; /* Deeper pink on hover */
+        border: none;
+    }
+    QPushButton:pressed {
+        background-color: #cc0066; /* Rich magenta when pressed */
+        border: none;
+        padding-top: 9px;
+        padding-bottom: 7px;
+    }
+    QPushButton:disabled {
+        background-color: #e0c0ce; /* Desaturated pink */
+        color: #ffffff;
+        border: none;
+    }
 
-        /* Tabs */
-        QTabWidget::pane {
-            border: 1px solid #3C3C3C;
-            border-top: none; /* Pane border only on sides/bottom */
-            background-color: #252525; /* Slightly darker pane */
-            border-bottom-left-radius: 6px;
-            border-bottom-right-radius: 6px;
-        }
-        QTabWidget::tab-bar {
-            left: 5px; /* Indent tab bar slightly */
-            alignment: left;
-        }
-        QTabBar::tab {
-            background: #3A3A3A;
-            border: 1px solid #4A4A4A;
-            border-bottom: none;
-            padding: 8px 15px;
-            margin-right: 3px;
-            border-top-left-radius: 5px;
-            border-top-right-radius: 5px;
-            color: #BBBBBB;
-        }
-        QTabBar::tab:selected {
-            background: #252525; /* Match pane background */
-            margin-bottom: -1px; /* Overlap pane border */
-            color: #FFFFFF;
-            border: 1px solid #3C3C3C; /* Match pane border */
-            border-bottom: 1px solid #252525; /* Hide bottom border */
-            font-weight: bold;
-        }
-        QTabBar::tab:!selected:hover {
-            background: #454545;
-            color: #DEDEDE;
-        }
+    /* Checkboxes */
+    QCheckBox {
+        spacing: 8px;
+        color: #212121;
+    }
+    QCheckBox::indicator {
+        width: 18px;
+        height: 18px;
+        border: 2px solid #ff85a2;
+        border-radius: 4px;
+    }
+    QCheckBox::indicator:checked {
+        background-color: #ff4d94;
+        border: 2px solid #ff4d94;
+        image: url(data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 18 18"><path fill="%23ffffff" d="M6.5 13.5L2 9l1.5-1.5L6.5 10.5 14 3l1.5 1.5z"/></svg>);
+    }
+    QCheckBox::indicator:unchecked {
+        background-color: #ffffff;
+    }
 
-        /* QListWidget (used for Album Tracks only now, maybe remove later) */
-        QListWidget {
-            background-color: #2F2F2F;
-            border: 1px solid #4A4A4A;
-            border-radius: 4px;
-            alternate-background-color: #333333; /* Subtle row difference */
-        }
-        QListWidget::item {
-            padding: 6px 4px;
-            border-bottom: 1px solid #383838; /* Separator line */
-        }
-        QListWidget::item:selected {
-            background-color: #005A9E; /* Darker selection blue */
-            color: #FFFFFF;
-            border: none; /* Remove border on selected item */
-            padding-left: 6px; /* Indent selected */
-        }
-        QListWidget::item:hover {
-            background-color: #3D3D3D;
-        }
+    /* Tabs */
+    QTabWidget::pane {
+        border: 2px solid #ff85a2;
+        border-top: none;
+        background-color: #fff5f8; /* Very light pink */
+        border-bottom-left-radius: 8px;
+        border-bottom-right-radius: 8px;
+    }
+    QTabWidget::tab-bar {
+        left: 5px;
+        alignment: left;
+    }
+    QTabBar::tab {
+        background: #ffd3e0; /* Light pink */
+        border: 2px solid #ff85a2;
+        border-bottom: none;
+        padding: 8px 16px;
+        margin-right: 3px;
+        border-top-left-radius: 6px;
+        border-top-right-radius: 6px;
+        color: #212121;
+        font-weight: bold;
+    }
+    QTabBar::tab:selected {
+        background: #fff5f8; /* Match pane background */
+        margin-bottom: -2px;
+        color: #ff4d94; /* Deep pink text when selected */
+        border: 2px solid #ff85a2;
+        border-bottom: 2px solid #fff5f8;
+    }
+    QTabBar::tab:!selected:hover {
+        background: #ffc1d6; /* Medium pink on hover */
+        color: #212121;
+    }
 
-        /* Scroll Area and Contents */
-        QScrollArea {
-            border: none;
-            background-color: transparent; /* Inherit background */
-        }
-        /* Style the QWidget *inside* the QScrollArea if needed */
-        #search_results_widget, #album_tracks_widget { /* Use object names */
-            background-color: #252525; /* Match tab pane */
-        }
+    /* Scroll Area and Contents */
+    QScrollArea {
+        border: none;
+        background-color: transparent;
+    }
+    #search_results_widget, #album_tracks_widget {
+        background-color: #fff5f8; /* Very light pink */
+    }
 
-        /* Search Result Item Frame */
-        QFrame#search_result_item {
-            background-color: #2F2F2F;
-            border: 1px solid #404040;
-            border-radius: 5px;
-            padding: 5px;
-        }
-        QFrame#search_result_item:hover {
-            background-color: #383838;
-            border: 1px solid #505050;
-        }
-        QFrame#search_result_item[selected="true"] {
-            background-color: #005A9E;
-            border: 1px solid #0078D7;
-        }
-        QFrame#search_result_item QLabel { /* Labels inside the frame */
-            background-color: transparent;
-            border: none;
-        }
-        QFrame#search_result_item[selected="true"] QLabel {
-            color: #FFFFFF;
-        }
-        QFrame#search_result_item[selected="true"] QLabel#artist_label {
-            color: #DDDDDD; /* Slightly dimmer artist in selected item */
-        }
+    /* Search Result Item Frame */
+    QFrame#search_result_item {
+        background-color: #ffffff;
+        border: 2px solid #ffd3e0;
+        border-radius: 8px;
+        padding: 8px;
+    }
+    QFrame#search_result_item:hover {
+        background-color: #fff0f5;
+        border: 2px solid #ff85a2;
+    }
+    QFrame#search_result_item[selected="true"] {
+        background-color: #ffd3e0;
+        border: 2px solid #ff4d94;
+    }
+    QFrame#search_result_item QLabel {
+        background-color: transparent;
+        border: none;
+    }
+    QFrame#search_result_item[selected="true"] QLabel {
+        color: #212121;
+    }
+    QFrame#search_result_item[selected="true"] QLabel#artist_label {
+        color: #7f5c7f; /* Slightly lighter purple in selected item */
+    }
 
-        /* Album Track Labels (inside scroll area) */
-        #album_tracks_widget QLabel {
-            padding: 4px 6px;
-            border-bottom: 1px solid #333333;
-        }
-        #album_tracks_widget QLabel:hover {
-            background-color: #383838;
-        }
+    /* Album Track Labels */
+    #album_tracks_widget QLabel {
+        padding: 6px 8px;
+        border-bottom: 1px solid #ffd3e0;
+        border-radius: 6px;
+    }
+    #album_tracks_widget QLabel:hover {
+        background-color: #ffd3e0;
+    }
 
+    /* Scroll Bars */
+    QScrollBar:vertical {
+        border: none;
+        background: #fff0f5;
+        width: 12px;
+        margin: 0px 0px 0px 0px;
+    }
+    QScrollBar::handle:vertical {
+        background: #ff85a2;
+        min-height: 25px;
+        border-radius: 6px;
+    }
+    QScrollBar::handle:vertical:hover {
+        background: #ff4d94;
+    }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+        height: 0px;
+        background: none;
+    }
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+        background: none;
+    }
+    QScrollBar:horizontal {
+        border: none;
+        background: #fff0f5;
+        height: 12px;
+        margin: 0px 0px 0px 0px;
+    }
+    QScrollBar::handle:horizontal {
+        background: #ff85a2;
+        min-width: 25px;
+        border-radius: 6px;
+    }
+    QScrollBar::handle:horizontal:hover {
+        background: #ff4d94;
+    }
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+        width: 0px;
+        background: none;
+    }
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+        background: none;
+    }
 
-        /* Scroll Bars */
-        QScrollBar:vertical {
-            border: none;
-            background: #2A2A2A;
-            width: 12px;
-            margin: 0px 0px 0px 0px;
-        }
-        QScrollBar::handle:vertical {
-            background: #555555;
-            min-height: 25px;
-            border-radius: 6px;
-        }
-        QScrollBar::handle:vertical:hover {
-            background: #656565;
-        }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-            height: 0px;
-            background: none;
-        }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-            background: none;
-        }
-        QScrollBar:horizontal {
-            border: none;
-            background: #2A2A2A;
-            height: 12px;
-            margin: 0px 0px 0px 0px;
-        }
-        QScrollBar::handle:horizontal {
-            background: #555555;
-            min-width: 25px;
-            border-radius: 6px;
-        }
-        QScrollBar::handle:horizontal:hover {
-            background: #656565;
-        }
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-            width: 0px;
-            background: none;
-        }
-        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-            background: none;
-        }
+    /* Progress Dialog */
+    QProgressDialog {
+        background-color: #fff5f8;
+        border: 2px solid #ff85a2;
+        border-radius: 8px;
+    }
+    QProgressDialog QLabel {
+        color: #212121;
+        padding: 5px;
+    }
+    QProgressBar {
+        border: 2px solid #ff85a2;
+        border-radius: 6px;
+        text-align: center;
+        background-color: #fff0f5;
+        color: #212121;
+    }
+    QProgressBar::chunk {
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff85a2, stop:1 #ff4d94);
+        border-radius: 5px;
+        margin: 2px;
+    }
+    QProgressDialog QPushButton {
+        min-width: 80px;
+        padding: 6px 12px;
+    }
 
-        /* Progress Dialog */
-        QProgressDialog {
-            background-color: #2A2A2A;
-            border: 1px solid #4A4A4A;
-            border-radius: 5px;
-        }
-        QProgressDialog QLabel {
-            color: #E0E0E0;
-            padding: 5px;
-        }
-        QProgressBar {
-            border: 1px solid #5A5A5A;
-            border-radius: 4px;
-            text-align: center;
-            background-color: #3A3A3A;
-            color: #FFFFFF; /* Text on progress bar */
-        }
-        QProgressBar::chunk {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0078D7, stop:1 #005A9E); /* Blue gradient chunk */
-            border-radius: 3px;
-            margin: 1px; /* Margin around the chunk */
-        }
-        QProgressDialog QPushButton { /* Style cancel button */
-            /* Inherits general button style, add specifics if needed */
-            min-width: 70px; /* Smaller cancel button */
-            padding: 5px 10px;
-        }
-
+    /* Message Boxes */
+    QMessageBox {
+        background-color: #fff5f8;
+    }
+    QMessageBox QLabel {
+        color: #212121;
+    }
+    QMessageBox QPushButton {
+        min-width: 80px;
+        padding: 6px 12px;
+    }
     """)
-
+    
     ex = LastfmScrobblerApp()
     ex.show()
     sys.exit(app.exec())
