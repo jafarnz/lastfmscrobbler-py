@@ -172,43 +172,56 @@ def get_session_key(token: str) -> str:
 
 def search_track(artist=None, track=None):
     """
-    Searches for a track on Last.fm. Returns a list of track results.
+    Searches for a track on Last.fm. Returns a list of track results,
+    with an 'image_url' key added for the largest available image.
     Either artist or track parameter can be provided alone for more dynamic searches.
     """
     search_params = {
-        'limit': 15  # Increased limit for more results
+        'limit': 15
     }
     
-    # Add parameters only if they're provided
     if artist and artist.strip():
         search_params['artist'] = artist.strip()
     
     if track and track.strip():
         search_params['track'] = track.strip()
         
-    # At least one parameter should be provided
     if not search_params.get('artist') and not search_params.get('track'):
         return []
     
     try:
         data = _make_api_request('track.search', params=search_params)
+        processed_tracks = []
         if (data and 'results' in data and
             'trackmatches' in data['results'] and
             'track' in data['results']['trackmatches']):
 
             tracks_data = data['results']['trackmatches']['track']
-            # Ensure tracks_data is always a list
+            
+            # Ensure tracks_data is always a list for iteration
             if isinstance(tracks_data, dict):
-                return [tracks_data]  # Wrap single track in a list
-            elif isinstance(tracks_data, list):
-                return tracks_data
+                tracks_data = [tracks_data]
+            
+            if isinstance(tracks_data, list):
+                for track_item in tracks_data:
+                    # Extract image URL
+                    image_url = None
+                    if 'image' in track_item and isinstance(track_item['image'], list):
+                        image_options = {img.get('#size'): img.get('#text') for img in track_item['image'] if img.get('#text')}
+                        for size_pref in ['extralarge', 'large', 'medium', 'small']:
+                            if size_pref in image_options and image_options[size_pref]:
+                                image_url = image_options[size_pref]
+                                break
+                    track_item['image_url'] = image_url # Add to the track dictionary
+                    processed_tracks.append(track_item)
+                return processed_tracks
             else:
-                return []  # No tracks found
+                return []
         else:
-            return []  # No results structure found
+            return []
     except LastfmApiError as e:
-        print(f"Error during track search: {e}")  # Log or handle differently in GUI
-        return []  # Return empty list on error for search
+        print(f"Error during track search: {e}")
+        return []
 
 
 def get_album_tracks(artist, album):
@@ -638,3 +651,54 @@ def scrobble_multiple_tracks(tracks_info, session_key, base_timestamp=None, dela
         progress_callback(total_individual_scrobbles, total_individual_scrobbles, "All batches processed.")
 
     return successful_scrobbles_overall, failed_scrobbles_overall
+
+# --- New function for track.updateNowPlaying ---
+def update_now_playing(session_key: str, artist: str, track: str, album: Optional[str] = None, album_artist: Optional[str] = None, duration: Optional[int] = None) -> bool:
+    """
+    Updates the user's 'Now Playing' status on Last.fm.
+    Returns True on success, False or raises error on failure.
+    """
+    if not session_key:
+        raise ValueError("Session key is required for updateNowPlaying.")
+    if not artist or not track:
+        raise ValueError("Artist and Track are required for updateNowPlaying.")
+
+    params = {
+        'artist': artist,
+        'track': track,
+    }
+    if album:
+        params['album'] = album
+    if album_artist: # Last.fm API uses 'albumArtist'
+        params['albumArtist'] = album_artist
+    if duration:
+        params['duration'] = str(duration) # Duration should be in seconds
+
+    try:
+        # track.updateNowPlaying is a POST request and requires signature
+        response_data = _make_api_request(
+            method='track.updateNowPlaying',
+            http_method='POST',
+            params=params,
+            requires_signature=True,
+            requires_session=True,
+            session_key=session_key
+        )
+        # Successful response for updateNowPlaying typically contains 'nowplaying' object
+        if response_data and 'nowplaying' in response_data:
+            print(f"Successfully updated Now Playing: {artist} - {track}")
+            return True
+        else:
+            # This case might indicate an issue not caught by LastfmApiError
+            print(f"Failed to update Now Playing. Response: {response_data}")
+            return False
+    except LastfmApiError as e:
+        # Specific handling for updateNowPlaying errors can be added if needed
+        print(f"API Error updating Now Playing for '{artist} - {track}': {e}")
+        # Depending on GUI needs, you might want to return False or re-raise
+        # For now, let's return False to indicate failure to the GUI
+        return False
+    except Exception as e:
+        print(f"Unexpected error updating Now Playing: {e}")
+        return False
+# -----------------------------------------------

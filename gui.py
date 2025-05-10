@@ -20,6 +20,7 @@ from main import (
     get_session_key, search_track, get_album_tracks, scrobble_multiple_tracks,
     get_track_info, get_album_info, # Added get_album_info
     search_artist, get_artist_info, get_artist_top_tracks, get_artist_albums, # Added artist functions
+    update_now_playing, # <<< Import new function
     LastfmApiError, API_KEY, API_SECRET, USERNAME, PASSWORD,
     get_auth_token, get_session_key_from_credentials,
 )
@@ -127,11 +128,6 @@ class LoginDialog(QDialog):
         auth_group.setLayout(auth_form)
         layout.addWidget(auth_group)
         
-        # Remember Me checkbox
-        self.remember_checkbox = QCheckBox("Remember credentials")
-        self.remember_checkbox.setChecked(True)  # Default to checked
-        layout.addWidget(self.remember_checkbox)
-        
         # Help text
         help_text = QLabel(
             "To get your API credentials:\n"
@@ -164,37 +160,30 @@ class LoginDialog(QDialog):
             if os.path.exists('config.json'):
                 with open('config.json', 'r') as f:
                     config = json.load(f)
-                    if config.get('remember_credentials', False):
-                        self.api_key_input.setText(config.get('api_key', ''))
-                        self.api_secret_input.setText(config.get('api_secret', ''))
-                        self.username_input.setText(config.get('username', ''))
-                        self.password_input.setText(config.get('password', ''))
-                        self.remember_checkbox.setChecked(True)
+                    # Always load if file exists, no 'remember_credentials' check needed
+                    self.api_key_input.setText(config.get('api_key', ''))
+                    self.api_secret_input.setText(config.get('api_secret', ''))
+                    self.username_input.setText(config.get('username', ''))
+                    self.password_input.setText(config.get('password', ''))
         except Exception as e:
             print(f"Error loading saved credentials: {e}")
     
     def save_credentials(self):
-        """Save credentials to the config file if remember is checked."""
-        if self.remember_checkbox.isChecked():
-            config = {
-                'api_key': self.api_key_input.text().strip(),
-                'api_secret': self.api_secret_input.text().strip(),
-                'username': self.username_input.text().strip(),
-                'password': self.password_input.text().strip(),
-                'remember_credentials': True
-            }
-            try:
-                with open('config.json', 'w') as f:
-                    json.dump(config, f)
-            except Exception as e:
-                print(f"Error saving credentials: {e}")
-        else:
-            # If remember is not checked, remove the config file if it exists
-            try:
-                if os.path.exists('config.json'):
-                    os.remove('config.json')
-            except Exception as e:
-                print(f"Error removing config file: {e}")
+        """Save credentials to the config file."""
+        # Always save credentials now
+        config = {
+            'api_key': self.api_key_input.text().strip(),
+            'api_secret': self.api_secret_input.text().strip(),
+            'username': self.username_input.text().strip(),
+            'password': self.password_input.text().strip(),
+            # No 'remember_credentials' field needed anymore
+        }
+        try:
+            with open('config.json', 'w') as f:
+                json.dump(config, f)
+        except Exception as e:
+            print(f"Error saving credentials: {e}")
+        # No else block needed to remove config.json, as we always save
     
     def get_credentials(self):
         return {
@@ -275,6 +264,13 @@ class LastfmScrobblerApp(QWidget):
         self._setup_search_tab()
         self._setup_album_tab()
 
+        # --- Set Search & Scrobble as default tab ---
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "Search & Scrobble":
+                self.tabs.setCurrentIndex(i)
+                break
+        # -------------------------------------------
+
         # --- Auth Button --- #
         self.auth_button = QPushButton("Authenticate")
         self.auth_button.clicked.connect(self.authenticate)
@@ -317,6 +313,13 @@ class LastfmScrobblerApp(QWidget):
         self.fetch_manual_album_info_button.clicked.connect(self.fetch_album_info_for_manual_scrobble)
         self.fetch_manual_album_info_button.setEnabled(False)
         scrobble_form_layout.addRow(self.fetch_manual_album_info_button)
+
+        # --- Add 'Update Now Playing' checkbox here ---
+        self.now_playing_checkbox = QCheckBox("✨ Update 'Now Playing' status?")
+        self.now_playing_checkbox.setChecked(True) # Default to checked
+        self.now_playing_checkbox.setToolTip("If checked, Last.fm will show this track as 'Now Playing' before scrobbling.")
+        scrobble_form_layout.addRow(self.now_playing_checkbox)
+        # -------------------------------------------
 
         scrobble_input_group.setLayout(scrobble_form_layout)
         scrobble_form_layout_main.addWidget(scrobble_input_group)
@@ -1456,10 +1459,19 @@ class LastfmScrobblerApp(QWidget):
             QMessageBox.critical(self, "Error", "Not authenticated. Please authenticate first.")
             return
 
+        # --- Logic for 'Now Playing' Update ---
+        # We'll call this before the confirmation dialog for immediate feedback
+        # but after basic track info is gathered.
+
+        current_artist = ""
+        current_track = ""
+        current_album = ""
+        # --------------------------------------
+
         if not tracks_to_scrobble: # If called from the manual scrobble tab
             artist = self.artist_input.text().strip()
             track = self.track_input.text().strip()
-            album = self.album_input.text().strip() or None # Use None if empty
+            album = self.album_input.text().strip() or None
             count = self.count_input.value()
 
             if not artist or not track:
@@ -1475,6 +1487,37 @@ class LastfmScrobblerApp(QWidget):
                 'album': album,
                 'count': count
             }]
+            current_artist, current_track, current_album = artist, track, album
+
+        else: # Called with a list (e.g., from search or album scrobble)
+            if tracks_to_scrobble:
+                first_track_info = tracks_to_scrobble[0]
+                current_artist = first_track_info.get('artist', '')
+                current_track = first_track_info.get('track', '')
+                current_album = first_track_info.get('album')
+
+        # --- Call 'Update Now Playing' if checkbox is checked and we have a track ---
+        if self.now_playing_checkbox.isChecked() and current_artist and current_track:
+            print(f"Updating Now Playing: {current_artist} - {current_track}")
+            # We can display the image of the 'Now Playing' track in the manual scrobble preview
+            # To do this robustly, we might need to fetch full track info if not already available
+            # For simplicity now, let's assume basic info is enough for the call, then fetch image
+            
+            # Fetch detailed info for image and accurate data for Now Playing
+            self.api_worker_now_playing = ApiWorker(get_track_info, current_artist, current_track)
+            # Chain the actual now_playing call after getting track_info
+            self.api_worker_now_playing.finished.connect(
+                lambda track_info_result: self._handle_now_playing_update(track_info_result, current_album)
+            )
+            self.api_worker_now_playing.error.connect(
+                lambda error_msg: self.status_label.setText(f"Status: Now Playing update failed: {error_msg}")
+            )
+            self.api_worker_now_playing.start()
+            # Note: The scrobble confirmation will proceed without waiting for this to finish.
+            # This is a design choice for responsiveness. User will see status updates.
+            self.status_label.setText(f"Status: Sending 'Now Playing' for {current_track}...")
+            self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+        # ----------------------------------------------------------------------
 
         total_scrobbles = sum(t['count'] for t in tracks_to_scrobble)
         if total_scrobbles == 0:
@@ -1826,6 +1869,75 @@ class LastfmScrobblerApp(QWidget):
             if child.widget():
                 child.widget().deleteLater()
 
+    # --- Handler for after get_track_info for Now Playing ---
+    def _handle_now_playing_update(self, track_info, original_album_context):
+        if not self.session_key:
+            return # Not authenticated
+
+        artist_to_update = ""
+        track_to_update = ""
+        album_to_update = ""
+        image_url_to_display = None
+
+        if track_info: # Detailed info fetched successfully
+            artist_to_update = track_info.get('artist', '')
+            track_to_update = track_info.get('name', '')
+            album_to_update = track_info.get('album_title') # Use specific album_title from get_track_info
+            image_url_to_display = track_info.get('image_url')
+            # Update the manual scrobble tab's preview image
+            if image_url_to_display:
+                self.request_image(image_url_to_display, self.manual_album_cover_label)
+            else:
+                self.manual_album_cover_label.setPixmap(self.get_placeholder_pixmap(self.manual_album_cover_label.sizeHint(), "No Cover"))
+        else: # Fallback if get_track_info failed, use originally passed context
+            # This situation should be less common if the track exists
+            # We'd need to grab artist/track from somewhere if this path is taken without prior context
+            # For now, this assumes `start_scrobble_task` set up `current_artist` and `current_track`
+            # The following is a bit redundant if track_info is None, let's rely on prior context if available
+            # Let's assume `current_artist`, `current_track`, `current_album` were set in `start_scrobble_task`
+            # This path needs refinement if `track_info` is None and no prior context exists.
+            # For safety, we should check if we have artist/track to update.
+            # This code is called from a lambda that has `current_album` (original_album_context)
+            # We need artist/track. Let's assume they were valid to initiate the get_track_info call.
+            # This part of the logic is tricky because api_worker_now_playing might be for a different track
+            # than what is currently in artist_input etc. Let's pass them through the lambda or store them.
+            # For now, this is simplified and might not always pick the right track if UI changes rapidly.
+            # A better approach: pass artist/track to this handler. Let's refine the lambda connection.
+            # For now, if track_info is None, we don't have enough to reliably update Now Playing or image.
+            self.status_label.setText(f"Status: Could not get track details for Now Playing.")
+            return
+
+        if not artist_to_update or not track_to_update:
+            self.status_label.setText(f"Status: Missing artist/track for Now Playing update.")
+            return
+
+        # Worker for the actual updateNowPlaying API call
+        self.api_worker_update = ApiWorker(
+            update_now_playing,
+            session_key=self.session_key,
+            artist=artist_to_update,
+            track=track_to_update,
+            album=album_to_update  # Use potentially more accurate album from track_info
+        )
+        self.api_worker_update.finished.connect(self._now_playing_api_finished)
+        self.api_worker_update.error.connect(self._now_playing_api_error)
+        self.api_worker_update.start()
+
+    def _now_playing_api_finished(self, success):
+        if success:
+            self.status_label.setText(f"Status: 'Now Playing' updated successfully.")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.status_label.setText(f"Status: Failed to update 'Now Playing' (API).")
+            self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+        # Potentially clear this worker ref: self.api_worker_update = None
+
+    def _now_playing_api_error(self, error_message):
+        self.status_label.setText(f"Status: Error updating 'Now Playing': {error_message}")
+        self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        # Potentially clear this worker ref: self.api_worker_update = None
+    # -----------------------------------------------------
+
 
 # --- Application Entry Point ---
 if __name__ == '__main__':
@@ -1896,9 +2008,9 @@ if __name__ == '__main__':
 
     /* Buttons */
     QPushButton {
-        background-color: #ff6699; /* Deeper pink for better visibility */
+        background-color: #cc0066; /* Much deeper pink for maximum visibility */
         color: #ffffff;
-        border: none;
+        border: 2px solid #ff85a2; /* Add border for better contrast */
         border-radius: 8px;
         padding: 8px 16px;
         min-width: 100px;
@@ -1906,8 +2018,8 @@ if __name__ == '__main__':
         letter-spacing: 1px;
     }
     QPushButton:hover {
-        background-color: #ff4d94; /* Deeper pink on hover */
-        border: none;
+        background-color: #ff4d94; /* Lighter on hover for feedback */
+        border: 2px solid #ff4d94;
     }
     QPushButton:pressed {
         background-color: #cc0066; /* Rich magenta when pressed */
