@@ -1896,7 +1896,7 @@ if __name__ == '__main__':
 
     /* Buttons */
     QPushButton {
-        background-color: #ff85a2; /* Hot pink */
+        background-color: #ff6699; /* Deeper pink for better visibility */
         color: #ffffff;
         border: none;
         border-radius: 8px;
