@@ -15,6 +15,7 @@ serving pure cunt for your last.fm needs since today. period.
 1. grab the latest release from [releases](https://github.com/jafarnz/swyft/releases)
 2. extract wherever tf you want
 3. double click and get your life
+4. mac girlies: the app now ships as a notarization-friendly `.app` bundle. unzip and drag it wherever (~/Applications works). credentials live in your user config (`~/Library/Application Support/cunty-scrobbler/config.json`), so no more files cluttering the app folder.
 
 ## before you start being cunty
 
@@ -65,6 +66,18 @@ serving pure cunt for your last.fm needs since today. period.
    ```bash
    python gui.py
    ```
+
+### building a mac release without crying
+
+1. make yourself a venv and install deps:
+   ```bash
+   pip install -r requirements.txt pyinstaller
+   ```
+2. run:
+   ```bash
+   ./scripts/build_macos_release.sh
+   ```
+3. you'll get `dist/macos/CuntyScrobbler.app` plus a zipped `CuntyScrobbler-macos.zip` ready to drop into a GitHub release.
 
 ## requirements
 

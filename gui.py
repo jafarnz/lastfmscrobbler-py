@@ -3,6 +3,8 @@ import time
 import io
 import json
 import os
+import platform
+from pathlib import Path
 from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -30,6 +32,24 @@ PLACEHOLDER_SIZE = 64
 ARTIST_IMAGE_SIZE = 96
 ALBUM_COVER_SIZE_MANUAL = 128
 ALBUM_COVER_SIZE_ALBUM_TAB = 150
+
+# Config file location (per-user, cross-platform)
+def _resolve_config_path() -> Path:
+    """Return a writable config path that works across macOS, Windows, and Linux."""
+    home = Path.home()
+    system = platform.system()
+
+    if system == "Darwin":
+        base = home / "Library" / "Application Support" / "cunty-scrobbler"
+    elif system == "Windows":
+        base = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming")) / "cunty-scrobbler"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "cunty-scrobbler"
+
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "config.json"
+
+CONFIG_FILE_PATH = _resolve_config_path()
 
 # --- Worker Thread for API Calls ---
 # To prevent the GUI from freezing during network requests
@@ -157,8 +177,8 @@ class LoginDialog(QDialog):
     def load_saved_credentials(self):
         """Load saved credentials from the config file."""
         try:
-            if os.path.exists('config.json'):
-                with open('config.json', 'r') as f:
+            if CONFIG_FILE_PATH.exists():
+                with open(CONFIG_FILE_PATH, 'r') as f:
                     config = json.load(f)
                     # Always load if file exists, no 'remember_credentials' check needed
                     self.api_key_input.setText(config.get('api_key', ''))
@@ -179,7 +199,7 @@ class LoginDialog(QDialog):
             # No 'remember_credentials' field needed anymore
         }
         try:
-            with open('config.json', 'w') as f:
+            with open(CONFIG_FILE_PATH, 'w') as f:
                 json.dump(config, f)
         except Exception as e:
             print(f"Error saving credentials: {e}")
@@ -2220,4 +2240,3 @@ if __name__ == '__main__':
     ex = LastfmScrobblerApp()
     ex.show()
     sys.exit(app.exec())
-
